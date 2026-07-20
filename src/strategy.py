@@ -14,7 +14,7 @@ from src.config import (
     NONFRACTIONAL_BASE_RATE,
     NONFRACTIONAL_STEP_RATE,
     PEAK_ACTIVATION_RATE,
-    TRAILING_DROP_FROM_PEAK,
+    TRAILING_STOP_PEAK_RATIO,
 )
 
 
@@ -23,12 +23,12 @@ def update_peak_and_threshold(
 ) -> tuple[Decimal, Decimal]:
     """Rule (every-second tick):
     1. peak = max(peak, current_rate)
-    2. if peak >= 10%: threshold = max(peak - 40%, current_rate / 2)
+    2. if peak >= 10%: threshold = max(peak * 30%, current_rate / 2)
        else: threshold unchanged
     """
     new_peak = max(peak, current_rate)
     if new_peak >= PEAK_ACTIVATION_RATE:
-        new_threshold = max(new_peak - TRAILING_DROP_FROM_PEAK, current_rate / 2)
+        new_threshold = max(new_peak * TRAILING_STOP_PEAK_RATIO, current_rate / 2)
     else:
         new_threshold = current_threshold
     return new_peak, new_threshold

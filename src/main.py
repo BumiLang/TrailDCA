@@ -70,24 +70,36 @@ class RunState:
 
 # ---------------------------------------------------------------------------
 # Market sessions (regular-hours windows), refreshed once/day at/after 08:00
-# KST -- late enough that the previous US regular session (which can spill
-# past midnight KST) has already ended.
+# KST. We keep both "today" and "previousBusinessDay" windows from the Toss
+# calendar response -- the US regular session spans past midnight KST, so a
+# process that (re)starts between 00:00 and the session's actual end must
+# still recognize it as open even though the calendar's "today" has no
+# session of its own (e.g. Saturday).
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class MarketSessions:
     loaded_date: str
-    kr_start: dt.datetime | None
-    kr_end: dt.datetime | None
-    us_start: dt.datetime | None
-    us_end: dt.datetime | None
+    kr_windows: list[tuple[dt.datetime, dt.datetime]]
+    us_windows: list[tuple[dt.datetime, dt.datetime]]
 
 
-def _parse_session(session: dict | None) -> tuple[dt.datetime | None, dt.datetime | None]:
+def _parse_session(session: dict | None) -> tuple[dt.datetime, dt.datetime] | None:
     if not session:
-        return None, None
+        return None
     return dt.datetime.fromisoformat(session["startTime"]), dt.datetime.fromisoformat(session["endTime"])
+
+
+def _regular_market_windows(calendar: dict, integrated: bool) -> list[tuple[dt.datetime, dt.datetime]]:
+    windows = []
+    for key in ("previousBusinessDay", "today"):
+        day = calendar.get(key) or {}
+        regular = (day.get("integrated") or {}).get("regularMarket") if integrated else day.get("regularMarket")
+        window = _parse_session(regular)
+        if window:
+            windows.append(window)
+    return windows
 
 
 def load_market_sessions(toss: TossClient) -> MarketSessions:
@@ -95,20 +107,30 @@ def load_market_sessions(toss: TossClient) -> MarketSessions:
     kr = toss.get_market_calendar("KR")
     us = toss.get_market_calendar("US")
 
-    kr_integrated = (kr.get("today") or {}).get("integrated") or {}
-    kr_start, kr_end = _parse_session(kr_integrated.get("regularMarket"))
-    us_start, us_end = _parse_session((us.get("today") or {}).get("regularMarket"))
+    kr_windows = _regular_market_windows(kr, integrated=True)
+    us_windows = _regular_market_windows(us, integrated=False)
 
-    return MarketSessions(today, kr_start, kr_end, us_start, us_end)
+    return MarketSessions(today, kr_windows, us_windows)
+
+
+def _active_session_day(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> str | None:
+    """isoformat date of the regular-market window covering `now`, or None if
+    the market is closed. For the US session (spans past midnight KST) this
+    is the window's *start* date, so a continuous overnight session keeps a
+    stable "trading day" key even after the KST calendar date rolls over --
+    used to dedupe the once-per-day buy trigger across that rollover.
+    """
+    if sessions is None:
+        return None
+    windows = sessions.kr_windows if market == Market.KR else sessions.us_windows
+    for start, end in windows:
+        if start <= now < end:
+            return start.date().isoformat()
+    return None
 
 
 def is_market_open(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> bool:
-    if sessions is None:
-        return False
-    start, end = (sessions.kr_start, sessions.kr_end) if market == Market.KR else (sessions.us_start, sessions.us_end)
-    if start is None or end is None:
-        return False
-    return start <= now < end
+    return _active_session_day(sessions, market, now) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +310,7 @@ def _attempt_daily_buy(
     current_rate: Decimal,
     executor: OrderExecutor,
     exchange_rate_usd_krw: Decimal,
-    today_str: str,
+    session_day: str,
     now: dt.datetime,
     updates: list,
 ) -> None:
@@ -311,7 +333,7 @@ def _attempt_daily_buy(
             return  # target reached, profit <=10%: no buy today (rule 4.2)
 
         order_amount_usd = (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
-        client_order_id = f"{today_str}-{row.symbol}-DCA"[:36]
+        client_order_id = f"{session_day}-{row.symbol}-DCA"[:36]
         try:
             result = executor.buy(
                 row.symbol, "USD", "MARKET", order_amount=order_amount_usd, client_order_id=client_order_id
@@ -334,7 +356,7 @@ def _attempt_daily_buy(
 
     # non-fractional path: KR always, or US once confirmed non-fractional / same-day fallback
     if strategy.nonfractional_should_buy(held_qty, current_rate):
-        client_order_id = f"{today_str}-{row.symbol}-ADD"[:36]
+        client_order_id = f"{session_day}-{row.symbol}-ADD"[:36]
         currency = "KRW" if row.market == Market.KR else "USD"
         result = executor.buy(row.symbol, currency, "MARKET", quantity=Decimal(1), client_order_id=client_order_id)
         new_rate = Decimal(result["profitLoss"]["rate"])
@@ -356,7 +378,6 @@ def process_symbol(
     sessions: MarketSessions,
     now: dt.datetime,
     run_state: RunState,
-    today_str: str,
     executor: OrderExecutor,
     exchange_rate_usd_krw: Decimal,
     updates: list,
@@ -364,7 +385,8 @@ def process_symbol(
     if not row.strategy_enabled or row.liquidated:
         logger.debug("%s skipped: strategy_enabled=%s liquidated=%s", row.symbol, row.strategy_enabled, row.liquidated)
         return
-    if not is_market_open(sessions, row.market, now):
+    session_day = _active_session_day(sessions, row.market, now)
+    if session_day is None:
         logger.debug("%s skipped: %s market closed", row.symbol, row.market.value)
         return
 
@@ -384,7 +406,7 @@ def process_symbol(
         )
 
         if strategy.should_liquidate(new_peak, current_rate, new_threshold):
-            client_order_id = f"{today_str}-{row.symbol}-EXIT"[:36]
+            client_order_id = f"{session_day}-{row.symbol}-EXIT"[:36]
             executor.liquidate(row.symbol, client_order_id=client_order_id)
             row.quantity = Decimal(0)
             row.purchase_amount_krw = Decimal(0)
@@ -396,10 +418,10 @@ def process_symbol(
             logger.info("LIQUIDATED %s peak=%.4f rate=%.4f threshold=%.4f", row.symbol, new_peak, current_rate, new_threshold)
             return
 
-    if run_state.bought_today(today_str, row.symbol):
+    if run_state.bought_today(session_day, row.symbol):
         return
-    run_state.mark_bought(today_str, row.symbol)  # mark attempted regardless of outcome; avoids retry storms on error
-    _attempt_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates)
+    run_state.mark_bought(session_day, row.symbol)  # mark attempted regardless of outcome; avoids retry storms on error
+    _attempt_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, session_day, now, updates)
 
 
 # ---------------------------------------------------------------------------
@@ -483,12 +505,10 @@ def main() -> None:
                 last_fx_refresh = time.monotonic()
                 sessions = load_market_sessions(toss)
                 logger.info(
-                    "sessions refreshed for %s: KR %s-%s / US %s-%s (USD/KRW=%s)",
+                    "sessions refreshed for %s: KR %s / US %s (USD/KRW=%s)",
                     today_str,
-                    sessions.kr_start,
-                    sessions.kr_end,
-                    sessions.us_start,
-                    sessions.us_end,
+                    sessions.kr_windows,
+                    sessions.us_windows,
                     exchange_rate_usd_krw,
                 )
             except Exception:
@@ -533,7 +553,7 @@ def main() -> None:
                 updates: list[tuple[int, str, str]] = []
                 for row in candidates:
                     try:
-                        process_symbol(row, items.get(row.symbol), sessions, now, run_state, today_str, executor, exchange_rate_usd_krw, updates)
+                        process_symbol(row, items.get(row.symbol), sessions, now, run_state, executor, exchange_rate_usd_krw, updates)
                     except Exception:
                         logger.exception("error processing %s; continuing with other symbols", row.symbol)
                 if updates:

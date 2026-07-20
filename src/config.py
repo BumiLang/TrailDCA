@@ -71,7 +71,7 @@ FRACTIONAL_RESUME_RATE = _Decimal("0.10")  # profit rate must exceed this to kee
 NONFRACTIONAL_BASE_RATE = _Decimal("0.10")
 NONFRACTIONAL_STEP_RATE = _Decimal("0.05")
 PEAK_ACTIVATION_RATE = _Decimal("0.10")
-TRAILING_DROP_FROM_PEAK = _Decimal("0.40")
+TRAILING_STOP_PEAK_RATIO = _Decimal("0.30")
 INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%
 
 TICK_SECONDS = 1

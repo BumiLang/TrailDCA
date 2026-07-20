@@ -18,17 +18,17 @@ class TestUpdatePeakAndThreshold:
         # peak hits exactly 10%, current_rate also 10%
         peak, threshold = strategy.update_peak_and_threshold(D("0.08"), D("0.10"), D("-1.00"))
         assert peak == D("0.10")
-        # max(peak-40%, rate/2) = max(-0.30, 0.05) = 0.05
+        # max(peak*30%, rate/2) = max(0.03, 0.05) = 0.05
         assert threshold == D("0.05")
 
-    def test_threshold_uses_peak_minus_40_when_higher(self):
-        # peak=60%, current rate dropped to 30% -> max(0.60-0.40, 0.30/2)=max(0.20,0.15)=0.20
+    def test_threshold_uses_peak_times_30pct_when_higher(self):
+        # peak=60%, current rate dropped to 30% -> max(0.60*0.30, 0.30/2)=max(0.18,0.15)=0.18
         peak, threshold = strategy.update_peak_and_threshold(D("0.60"), D("0.30"), D("0.10"))
         assert peak == D("0.60")
-        assert threshold == D("0.20")
+        assert threshold == D("0.18")
 
     def test_threshold_uses_half_current_rate_when_higher(self):
-        # peak=15%, current rate spikes to 50% -> max(0.15-0.40, 0.50/2)=max(-0.25,0.25)=0.25
+        # peak=15%, current rate spikes to 50% -> max(0.50*0.30, 0.50/2)=max(0.15,0.25)=0.25
         peak, threshold = strategy.update_peak_and_threshold(D("0.15"), D("0.50"), D("0.05"))
         assert peak == D("0.50")
         assert threshold == D("0.25")

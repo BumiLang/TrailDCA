@@ -1,7 +1,0 @@
-requests>=2.31
-python-dotenv>=1.0
-gspread>=6.1
-google-auth>=2.29
-tzdata>=2024.1
-pytest>=8.0
-truststore>=0.9; platform_system == "Windows"
