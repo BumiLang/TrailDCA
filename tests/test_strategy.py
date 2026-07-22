@@ -18,20 +18,26 @@ class TestUpdatePeakAndThreshold:
         # peak hits exactly 10%, current_rate also 10%
         peak, threshold = strategy.update_peak_and_threshold(D("0.08"), D("0.10"), D("-1.00"))
         assert peak == D("0.10")
-        # max(peak*30%, rate/2) = max(0.03, 0.05) = 0.05
-        assert threshold == D("0.05")
+        # peak*0.75 - 0.035 = 0.10*0.75-0.035 = 0.04
+        assert threshold == D("0.04")
 
-    def test_threshold_uses_peak_times_30pct_when_higher(self):
-        # peak=60%, current rate dropped to 30% -> max(0.60*0.30, 0.30/2)=max(0.18,0.15)=0.18
-        peak, threshold = strategy.update_peak_and_threshold(D("0.60"), D("0.30"), D("0.10"))
-        assert peak == D("0.60")
-        assert threshold == D("0.18")
+    def test_threshold_scales_linearly_below_breakpoint(self):
+        # peak=25% -> 0.25*0.75-0.035 = 0.1525
+        peak, threshold = strategy.update_peak_and_threshold(D("0.10"), D("0.25"), D("0.15"))
+        assert peak == D("0.25")
+        assert threshold == D("0.1525")
 
-    def test_threshold_uses_half_current_rate_when_higher(self):
-        # peak=15%, current rate spikes to 50% -> max(0.50*0.30, 0.50/2)=max(0.15,0.25)=0.25
-        peak, threshold = strategy.update_peak_and_threshold(D("0.15"), D("0.50"), D("0.05"))
-        assert peak == D("0.50")
-        assert threshold == D("0.25")
+    def test_threshold_switches_formula_at_30pct_breakpoint(self):
+        # peak=30% -> high-slope branch: 0.30*0.7 = 0.21
+        peak, threshold = strategy.update_peak_and_threshold(D("0.25"), D("0.30"), D("0.1525"))
+        assert peak == D("0.30")
+        assert threshold == D("0.21")
+
+    def test_threshold_uses_high_slope_above_breakpoint(self):
+        # peak=90% -> 0.90*0.7 = 0.63
+        peak, threshold = strategy.update_peak_and_threshold(D("0.50"), D("0.90"), D("0.42"))
+        assert peak == D("0.90")
+        assert threshold == D("0.63")
 
     def test_peak_never_decreases(self):
         peak, _ = strategy.update_peak_and_threshold(D("0.30"), D("0.10"), D("-0.10"))

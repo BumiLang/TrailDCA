@@ -14,7 +14,10 @@ from src.config import (
     NONFRACTIONAL_BASE_RATE,
     NONFRACTIONAL_STEP_RATE,
     PEAK_ACTIVATION_RATE,
-    TRAILING_STOP_PEAK_RATIO,
+    TAKE_PROFIT_BREAKPOINT,
+    TAKE_PROFIT_HIGH_SLOPE,
+    TAKE_PROFIT_LOW_BASE,
+    TAKE_PROFIT_LOW_SLOPE,
 )
 
 
@@ -23,12 +26,17 @@ def update_peak_and_threshold(
 ) -> tuple[Decimal, Decimal]:
     """Rule (every-second tick):
     1. peak = max(peak, current_rate)
-    2. if peak >= 10%: threshold = max(peak * 30%, current_rate / 2)
+    2. if peak >= 10%:
+         threshold = peak * 0.75 - 3.5%   (peak < 30%)
+         threshold = peak * 0.7           (peak >= 30%)
        else: threshold unchanged
     """
     new_peak = max(peak, current_rate)
     if new_peak >= PEAK_ACTIVATION_RATE:
-        new_threshold = max(new_peak * TRAILING_STOP_PEAK_RATIO, current_rate / 2)
+        if new_peak < TAKE_PROFIT_BREAKPOINT:
+            new_threshold = new_peak * TAKE_PROFIT_LOW_SLOPE + TAKE_PROFIT_LOW_BASE
+        else:
+            new_threshold = new_peak * TAKE_PROFIT_HIGH_SLOPE
     else:
         new_threshold = current_threshold
     return new_peak, new_threshold

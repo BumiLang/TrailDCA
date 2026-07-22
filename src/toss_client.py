@@ -50,6 +50,17 @@ class TossApiError(Exception):
         self.request_id = request_id
 
 
+class OrderNotFilledError(Exception):
+    """Raised when an order reached a terminal status other than FILLED
+    (e.g. REJECTED, CANCELED) -- as opposed to TossApiError, which covers
+    HTTP-level rejections at submission time."""
+
+    def __init__(self, order: dict):
+        self.order = order
+        self.status = order.get("status", "UNKNOWN")
+        super().__init__(f"order not filled: status={self.status} order_id={order.get('orderId')}")
+
+
 class _RateLimiter:
     """Simple per-group leaky-bucket limiter: blocks the caller just long
     enough to keep calls within the group's requests/second budget."""

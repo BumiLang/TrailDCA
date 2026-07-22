@@ -57,7 +57,17 @@ class SheetsClient:
         # and turn rate/amount fields into lossy binary floats before we ever
         # get a chance to parse them as Decimal.
         records = self._ws.get_all_records(expected_headers=SHEET_COLUMNS, numericise_ignore=["all"])
-        return [SheetRow.from_record(i + 2, record) for i, record in enumerate(records)]
+        rows = []
+        for i, record in enumerate(records):
+            row_number = i + 2
+            try:
+                rows.append(SheetRow.from_record(row_number, record))
+            except Exception:
+                # One malformed row (bad market code, non-numeric cell after a
+                # manual edit, ...) must not take every other symbol down with
+                # it -- skip it and keep going.
+                logger.exception("skipping malformed sheet row %d: %r", row_number, record)
+        return rows
 
     def append_default_row(
         self,

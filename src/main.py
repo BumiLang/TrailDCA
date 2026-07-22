@@ -11,18 +11,20 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import signal
 import sys
 import time
 from dataclasses import dataclass
 from decimal import Decimal
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from src import strategy
 from src.config import DAILY_SNAPSHOT_HOUR_KST, KST, PROJECT_ROOT, STATE_FILE, TICK_SECONDS, Config
 from src.models import FractionalStatus, Market, SheetRow
 from src.sheets_client import SheetsClient, fraction_to_percent_str
-from src.toss_client import TossApiError, TossClient
+from src.toss_client import OrderNotFilledError, TossApiError, TossClient
 
 logger = logging.getLogger("traildca")
 
@@ -38,68 +40,94 @@ class RunState:
     def __init__(self, path: Path):
         self._path = path
         self.last_snapshot_date: str | None = None
+        # tracks the once/day fractional DCA attempt (rule 4)
         self.daily_buys: dict[str, list[str]] = {}
+        # tracks the once/day whole-share add-on buy (rule 5), separate from
+        # daily_buys because it's only marked once an order actually fills --
+        # the condition itself is re-checked every tick until it does.
+        self.share_buys: dict[str, list[str]] = {}
         self._load()
 
     def _load(self) -> None:
-        if self._path.exists():
+        if not self._path.exists():
+            return
+        try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            self.last_snapshot_date = data.get("last_snapshot_date")
-            self.daily_buys = data.get("daily_buys", {})
+        except (json.JSONDecodeError, OSError):
+            logger.exception("state.json is corrupted or unreadable; starting from a fresh run-state")
+            return
+        self.last_snapshot_date = data.get("last_snapshot_date")
+        self.daily_buys = data.get("daily_buys", {})
+        self.share_buys = data.get("share_buys", {})
 
     def save(self) -> None:
-        self._path.write_text(
-            json.dumps(
-                {"last_snapshot_date": self.last_snapshot_date, "daily_buys": self.daily_buys},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "last_snapshot_date": self.last_snapshot_date,
+                "daily_buys": self.daily_buys,
+                "share_buys": self.share_buys,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
+        # write-then-rename so a crash mid-write can never leave a truncated/
+        # corrupt state.json behind (os.replace is atomic on POSIX and Windows)
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        # Retry the rename: on Windows, cloud-sync/antivirus can momentarily
+        # hold a lock on the destination right after it's written, which
+        # surfaces as a transient PermissionError rather than a real failure.
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, self._path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+
+    @staticmethod
+    def _prune(buys: dict[str, list[str]], keep: int = 3) -> None:
+        for old_date in sorted(buys)[:-keep] if len(buys) > keep else []:
+            del buys[old_date]
 
     def bought_today(self, date_str: str, symbol: str) -> bool:
         return symbol in self.daily_buys.get(date_str, [])
 
     def mark_bought(self, date_str: str, symbol: str) -> None:
         self.daily_buys.setdefault(date_str, []).append(symbol)
-        for old_date in [d for d in self.daily_buys if d < date_str]:
-            if len(self.daily_buys) > 3:
-                del self.daily_buys[old_date]
+        self._prune(self.daily_buys)
+        self.save()
+
+    def share_bought_today(self, date_str: str, symbol: str) -> bool:
+        return symbol in self.share_buys.get(date_str, [])
+
+    def mark_share_bought(self, date_str: str, symbol: str) -> None:
+        self.share_buys.setdefault(date_str, []).append(symbol)
+        self._prune(self.share_buys)
         self.save()
 
 
 # ---------------------------------------------------------------------------
 # Market sessions (regular-hours windows), refreshed once/day at/after 08:00
-# KST. We keep both "today" and "previousBusinessDay" windows from the Toss
-# calendar response -- the US regular session spans past midnight KST, so a
-# process that (re)starts between 00:00 and the session's actual end must
-# still recognize it as open even though the calendar's "today" has no
-# session of its own (e.g. Saturday).
+# KST -- late enough that the previous US regular session (which can spill
+# past midnight KST) has already ended.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class MarketSessions:
     loaded_date: str
-    kr_windows: list[tuple[dt.datetime, dt.datetime]]
-    us_windows: list[tuple[dt.datetime, dt.datetime]]
+    kr_start: dt.datetime | None
+    kr_end: dt.datetime | None
+    us_start: dt.datetime | None
+    us_end: dt.datetime | None
 
 
-def _parse_session(session: dict | None) -> tuple[dt.datetime, dt.datetime] | None:
+def _parse_session(session: dict | None) -> tuple[dt.datetime | None, dt.datetime | None]:
     if not session:
-        return None
+        return None, None
     return dt.datetime.fromisoformat(session["startTime"]), dt.datetime.fromisoformat(session["endTime"])
-
-
-def _regular_market_windows(calendar: dict, integrated: bool) -> list[tuple[dt.datetime, dt.datetime]]:
-    windows = []
-    for key in ("previousBusinessDay", "today"):
-        day = calendar.get(key) or {}
-        regular = (day.get("integrated") or {}).get("regularMarket") if integrated else day.get("regularMarket")
-        window = _parse_session(regular)
-        if window:
-            windows.append(window)
-    return windows
 
 
 def load_market_sessions(toss: TossClient) -> MarketSessions:
@@ -107,30 +135,20 @@ def load_market_sessions(toss: TossClient) -> MarketSessions:
     kr = toss.get_market_calendar("KR")
     us = toss.get_market_calendar("US")
 
-    kr_windows = _regular_market_windows(kr, integrated=True)
-    us_windows = _regular_market_windows(us, integrated=False)
+    kr_integrated = (kr.get("today") or {}).get("integrated") or {}
+    kr_start, kr_end = _parse_session(kr_integrated.get("regularMarket"))
+    us_start, us_end = _parse_session((us.get("today") or {}).get("regularMarket"))
 
-    return MarketSessions(today, kr_windows, us_windows)
-
-
-def _active_session_day(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> str | None:
-    """isoformat date of the regular-market window covering `now`, or None if
-    the market is closed. For the US session (spans past midnight KST) this
-    is the window's *start* date, so a continuous overnight session keeps a
-    stable "trading day" key even after the KST calendar date rolls over --
-    used to dedupe the once-per-day buy trigger across that rollover.
-    """
-    if sessions is None:
-        return None
-    windows = sessions.kr_windows if market == Market.KR else sessions.us_windows
-    for start, end in windows:
-        if start <= now < end:
-            return start.date().isoformat()
-    return None
+    return MarketSessions(today, kr_start, kr_end, us_start, us_end)
 
 
 def is_market_open(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> bool:
-    return _active_session_day(sessions, market, now) is not None
+    if sessions is None:
+        return False
+    start, end = (sessions.kr_start, sessions.kr_end) if market == Market.KR else (sessions.us_start, sessions.us_end)
+    if start is None or end is None:
+        return False
+    return start <= now < end
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +176,7 @@ class OrderExecutor:
         quantity: Decimal | None = None,
         order_amount: Decimal | None = None,
         client_order_id: str = "",
+        current_holding: dict | None = None,
     ) -> dict:
         if self._live:
             order = self._toss.place_order(
@@ -169,17 +188,31 @@ class OrderExecutor:
                 order_amount=order_amount,
                 client_order_id=client_order_id,
             )
-            self._toss.wait_for_terminal_status(self._account_seq, order["orderId"])
+            final = self._toss.wait_for_terminal_status(self._account_seq, order["orderId"])
+            if final.get("status") != "FILLED":
+                raise OrderNotFilledError(final)
             holdings = self._toss.get_holdings(self._account_seq, symbol=symbol)
             items = holdings.get("items", [])
             if not items:
-                raise RuntimeError(f"buy order for {symbol} settled but holdings lookup returned nothing")
+                raise RuntimeError(f"buy order for {symbol} filled but holdings lookup returned nothing")
             return items[0]
 
         # dry-run: never calls place_order. Simulated against the latest
-        # real price so logs/sheet stay directionally meaningful.
+        # real price so logs/sheet stay directionally meaningful. The first
+        # touch of a symbol seeds the running simulation from its real
+        # current holding (if any) so a simulated buy layers on top of the
+        # actual position instead of overwriting the sheet with a phantom
+        # from-zero position.
+        if symbol not in self._sim:
+            if current_holding is not None:
+                self._sim[symbol] = {
+                    "quantity": Decimal(current_holding["quantity"]),
+                    "purchase_amount": Decimal(current_holding["marketValue"]["purchaseAmount"]),
+                }
+            else:
+                self._sim[symbol] = {"quantity": Decimal(0), "purchase_amount": Decimal(0)}
         price = self._current_price(symbol)
-        sim = self._sim.setdefault(symbol, {"quantity": Decimal(0), "purchase_amount": Decimal(0)})
+        sim = self._sim[symbol]
         if order_amount is not None:
             bought_qty = order_amount / price
             cost = order_amount
@@ -218,7 +251,9 @@ class OrderExecutor:
                 quantity=sellable,
                 client_order_id=client_order_id,
             )
-            self._toss.wait_for_terminal_status(self._account_seq, order["orderId"])
+            final = self._toss.wait_for_terminal_status(self._account_seq, order["orderId"])
+            if final.get("status") != "FILLED":
+                raise OrderNotFilledError(final)
         else:
             sim = self._sim.pop(symbol, None)
             logger.info("[DRY-RUN] SELL(all) %s qty=%s", symbol, sim["quantity"] if sim else "0")
@@ -258,18 +293,6 @@ def daily_snapshot(
             updates.append((row.row_number, "매입금액_원화", str(purchase_krw.quantize(Decimal("1")))))
             updates.append((row.row_number, "수익률", fraction_to_percent_str(rate)))
             updates.append((row.row_number, "마지막갱신", now_iso))
-
-            # Also refresh 최고수익률/익절기준 here (not just during the market-hours
-            # tick loop) so they don't sit stale from yesterday's close until the
-            # market reopens. Only the *values* are recomputed -- liquidation is
-            # never executed outside the tick loop, since trading is only allowed
-            # during that symbol's regular market hours.
-            if row.strategy_enabled and not row.liquidated:
-                new_peak, new_threshold = strategy.update_peak_and_threshold(
-                    row.peak_rate, rate, row.take_profit_threshold
-                )
-                updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
-                updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
         else:
             sheets.append_default_row(
                 symbol,
@@ -304,72 +327,111 @@ def _is_fractional_unsupported_error(err: TossApiError) -> bool:
     return err.code == "stock-restricted" and "소수" in (err.message or "")
 
 
-def _attempt_daily_buy(
+def _attempt_fractional_daily_buy(
     row: SheetRow,
     item: dict | None,
     current_rate: Decimal,
     executor: OrderExecutor,
     exchange_rate_usd_krw: Decimal,
-    session_day: str,
+    today_str: str,
     now: dt.datetime,
     updates: list,
 ) -> None:
-    held_qty = Decimal(item["quantity"]) if item else Decimal(0)
+    """Rule 4: once/day, fixed 5,000 KRW fractional DCA buy for US symbols.
+    Runs once per day regardless of outcome -- the amount doesn't depend on
+    intraday rate movement, so re-checking more often would never buy more.
+    """
+    if row.market != Market.US or row.fractional_status == FractionalStatus.NO:
+        return
+
     purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw) if item else row.purchase_amount_krw
+    amount_krw = strategy.fractional_daily_buy_amount_krw(purchase_krw, current_rate)
+    if amount_krw is None:
+        logger.debug(
+            "%s: no fractional buy today (target reached at %s KRW, rate %.4f not > 10%%)",
+            row.symbol, purchase_krw, current_rate,
+        )
+        return  # target reached, profit <=10%: no buy today (rule 4.2)
 
-    try_fractional = row.market == Market.US and row.fractional_status != FractionalStatus.NO
-    logger.debug(
-        "%s daily-buy check: held_qty=%s purchase_krw=%s rate=%.4f try_fractional=%s fractional_status=%s",
-        row.symbol, held_qty, purchase_krw, current_rate, try_fractional, row.fractional_status,
-    )
-
-    if try_fractional:
-        amount_krw = strategy.fractional_daily_buy_amount_krw(purchase_krw, current_rate)
-        if amount_krw is None:
-            logger.debug(
-                "%s: no fractional buy today (target reached at %s KRW, rate %.4f not > 10%%)",
-                row.symbol, purchase_krw, current_rate,
+    order_amount_usd = (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
+    client_order_id = f"{today_str}-{row.symbol}-DCA"[:36]
+    try:
+        result = executor.buy(
+            row.symbol,
+            "USD",
+            "MARKET",
+            order_amount=order_amount_usd,
+            client_order_id=client_order_id,
+            current_holding=item,
+        )
+    except TossApiError as e:
+        if _is_fractional_unsupported_error(e):
+            row.fractional_status = FractionalStatus.NO
+            updates.append((row.row_number, "소수점가능여부", "FALSE"))
+            logger.info(
+                "%s: fractional not supported (%s); whole-share rule takes over from now on",
+                row.symbol, e.message,
             )
-            return  # target reached, profit <=10%: no buy today (rule 4.2)
+        else:
+            logger.warning("fractional buy failed for %s: %s", row.symbol, e)
+        return
+    except OrderNotFilledError as e:
+        logger.warning("fractional buy for %s did not fill (status=%s); will retry tomorrow", row.symbol, e.status)
+        return
 
-        order_amount_usd = (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
-        client_order_id = f"{session_day}-{row.symbol}-DCA"[:36]
-        try:
-            result = executor.buy(
-                row.symbol, "USD", "MARKET", order_amount=order_amount_usd, client_order_id=client_order_id
-            )
-            if row.fractional_status == FractionalStatus.UNKNOWN:
-                row.fractional_status = FractionalStatus.YES
-                updates.append((row.row_number, "소수점가능여부", "TRUE"))
-            _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
-            logger.info("BUY(amount) %s target=%sKRW (%sUSD)", row.symbol, amount_krw, order_amount_usd)
-            return
-        except TossApiError as e:
-            if _is_fractional_unsupported_error(e):
-                row.fractional_status = FractionalStatus.NO
-                updates.append((row.row_number, "소수점가능여부", "FALSE"))
-                logger.info("%s: fractional not supported (%s) - falling back to whole-share rule today", row.symbol, e.message)
-                # fall through to the non-fractional branch below, same day
-            else:
-                logger.warning("buy failed for %s: %s", row.symbol, e)
-                return
+    if row.fractional_status == FractionalStatus.UNKNOWN:
+        row.fractional_status = FractionalStatus.YES
+        updates.append((row.row_number, "소수점가능여부", "TRUE"))
+    _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+    logger.info("BUY(amount) %s target=%sKRW (%sUSD)", row.symbol, amount_krw, order_amount_usd)
 
-    # non-fractional path: KR always, or US once confirmed non-fractional / same-day fallback
-    if strategy.nonfractional_should_buy(held_qty, current_rate):
-        client_order_id = f"{session_day}-{row.symbol}-ADD"[:36]
-        currency = "KRW" if row.market == Market.KR else "USD"
-        result = executor.buy(row.symbol, currency, "MARKET", quantity=Decimal(1), client_order_id=client_order_id)
-        new_rate = Decimal(result["profitLoss"]["rate"])
-        row.peak_rate = strategy.peak_after_nonfractional_buy(new_rate)
-        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
-        _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
-        logger.info("BUY(1 share) %s new_rate=%.4f", row.symbol, new_rate)
-    else:
+
+def _attempt_nonfractional_buy(
+    row: SheetRow,
+    item: dict | None,
+    held_qty: Decimal,
+    current_rate: Decimal,
+    executor: OrderExecutor,
+    exchange_rate_usd_krw: Decimal,
+    today_str: str,
+    now: dt.datetime,
+    updates: list,
+) -> bool:
+    """Rule 5: whole-share add-on buy. The caller re-checks this every tick
+    (same cadence as the peak/threshold/liquidation check) while the day's
+    buy hasn't happened yet, so a rate that crosses the required bar at any
+    point during the session -- not just at market open -- triggers a market
+    order. Returns True iff an order actually filled.
+    """
+    if not strategy.nonfractional_should_buy(held_qty, current_rate):
         required = strategy.nonfractional_required_rate(held_qty) if held_qty >= 1 else None
         logger.debug(
-            "%s: no whole-share buy today (held_qty=%s rate=%.4f required=%s)",
+            "%s: whole-share buy condition not met (held_qty=%s rate=%.4f required=%s)",
             row.symbol, held_qty, current_rate, required,
         )
+        return False
+
+    client_order_id = f"{today_str}-{row.symbol}-ADD"[:36]
+    currency = "KRW" if row.market == Market.KR else "USD"
+    try:
+        result = executor.buy(
+            row.symbol,
+            currency,
+            "MARKET",
+            quantity=Decimal(1),
+            client_order_id=client_order_id,
+            current_holding=item,
+        )
+    except (TossApiError, OrderNotFilledError) as e:
+        logger.warning("whole-share buy failed for %s, will retry next tick: %s", row.symbol, e)
+        return False
+
+    new_rate = Decimal(result["profitLoss"]["rate"])
+    row.peak_rate = strategy.peak_after_nonfractional_buy(new_rate)
+    updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
+    _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+    logger.info("BUY(1 share) %s new_rate=%.4f", row.symbol, new_rate)
+    return True
 
 
 def process_symbol(
@@ -378,6 +440,7 @@ def process_symbol(
     sessions: MarketSessions,
     now: dt.datetime,
     run_state: RunState,
+    today_str: str,
     executor: OrderExecutor,
     exchange_rate_usd_krw: Decimal,
     updates: list,
@@ -385,13 +448,13 @@ def process_symbol(
     if not row.strategy_enabled or row.liquidated:
         logger.debug("%s skipped: strategy_enabled=%s liquidated=%s", row.symbol, row.strategy_enabled, row.liquidated)
         return
-    session_day = _active_session_day(sessions, row.market, now)
-    if session_day is None:
+    if not is_market_open(sessions, row.market, now):
         logger.debug("%s skipped: %s market closed", row.symbol, row.market.value)
         return
 
     held = item is not None
     current_rate = Decimal(item["profitLoss"]["rate"]) if held else Decimal(0)
+    held_qty = Decimal(item["quantity"]) if held else Decimal(0)
 
     if held:
         new_peak, new_threshold = strategy.update_peak_and_threshold(row.peak_rate, current_rate, row.take_profit_threshold)
@@ -406,8 +469,15 @@ def process_symbol(
         )
 
         if strategy.should_liquidate(new_peak, current_rate, new_threshold):
-            client_order_id = f"{session_day}-{row.symbol}-EXIT"[:36]
-            executor.liquidate(row.symbol, client_order_id=client_order_id)
+            client_order_id = f"{today_str}-{row.symbol}-EXIT"[:36]
+            try:
+                executor.liquidate(row.symbol, client_order_id=client_order_id)
+            except (TossApiError, OrderNotFilledError) as e:
+                # Do NOT mark liquidated on a failed/rejected sell -- the
+                # position is still real. Leave state untouched so the next
+                # tick's should_liquidate check retries the sell.
+                logger.warning("liquidation failed for %s, will retry next tick: %s", row.symbol, e)
+                return
             row.quantity = Decimal(0)
             row.purchase_amount_krw = Decimal(0)
             row.liquidated = True
@@ -418,10 +488,18 @@ def process_symbol(
             logger.info("LIQUIDATED %s peak=%.4f rate=%.4f threshold=%.4f", row.symbol, new_peak, current_rate, new_threshold)
             return
 
-    if run_state.bought_today(session_day, row.symbol):
-        return
-    run_state.mark_bought(session_day, row.symbol)  # mark attempted regardless of outcome; avoids retry storms on error
-    _attempt_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, session_day, now, updates)
+    # Rule 4 (fractional DCA): fixed amount, doesn't depend on intraday rate
+    # movement, so a once/day attempt is sufficient.
+    if not run_state.bought_today(today_str, row.symbol):
+        run_state.mark_bought(today_str, row.symbol)  # mark attempted regardless of outcome; avoids retry storms on error
+        _attempt_fractional_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates)
+
+    # Rule 5 (whole-share add-on): re-checked every tick -- same cadence as
+    # the take-profit check above -- so a rate crossing the required bar at
+    # any point in the session triggers the market buy, not just at open.
+    if not run_state.share_bought_today(today_str, row.symbol):
+        if _attempt_nonfractional_buy(row, item, held_qty, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates):
+            run_state.mark_share_bought(today_str, row.symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +516,9 @@ def _setup_logging(level: str) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(PROJECT_ROOT / "traildca.log", encoding="utf-8"),
+            RotatingFileHandler(
+                PROJECT_ROOT / "traildca.log", maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            ),
         ],
     )
     logger.setLevel(level)
@@ -466,23 +546,9 @@ def main() -> None:
     executor = OrderExecutor(toss, account_seq, live=config.live_trading)
 
     sessions: MarketSessions | None = None
-    try:
-        exchange_rate_usd_krw = Decimal(toss.get_exchange_rate("USD", "KRW")["rate"])
-    except Exception:
-        exchange_rate_usd_krw = Decimal("1300")
-        logger.exception("failed to fetch initial USD/KRW rate; using fallback %s", exchange_rate_usd_krw)
-    last_fx_refresh = time.monotonic()
-
-    # Startup refresh: sync real holdings and recompute 최고수익률/익절기준 right
-    # away, independent of the 08:00 KST daily-snapshot gate below, so a
-    # mid-day restart doesn't leave the sheet showing stale peak/threshold
-    # values until the next tick.
-    logger.info("running startup snapshot (holdings + 최고수익률/익절기준 refresh)")
-    try:
-        daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw)
-    except Exception:
-        logger.exception("startup snapshot failed; will retry at the next daily snapshot window")
-    active_rows: list[SheetRow] = sheets.read_rows()
+    exchange_rate_usd_krw = Decimal("1300")  # seed; refreshed before first real use below
+    active_rows: list[SheetRow] = []
+    last_fx_refresh = 0.0
 
     stop = {"flag": False}
 
@@ -495,72 +561,83 @@ def main() -> None:
 
     while not stop["flag"]:
         loop_start = time.monotonic()
-        now = dt.datetime.now(KST)
-        today_str = now.date().isoformat()
+        try:
+            now = dt.datetime.now(KST)
+            today_str = now.date().isoformat()
 
-        if sessions is None or (sessions.loaded_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST):
-            try:
-                rate_resp = toss.get_exchange_rate("USD", "KRW")
-                exchange_rate_usd_krw = Decimal(rate_resp["rate"])
+            if sessions is None or (sessions.loaded_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST):
+                try:
+                    rate_resp = toss.get_exchange_rate("USD", "KRW")
+                    exchange_rate_usd_krw = Decimal(rate_resp["rate"])
+                    last_fx_refresh = time.monotonic()
+                    sessions = load_market_sessions(toss)
+                    logger.info(
+                        "sessions refreshed for %s: KR %s-%s / US %s-%s (USD/KRW=%s)",
+                        today_str,
+                        sessions.kr_start,
+                        sessions.kr_end,
+                        sessions.us_start,
+                        sessions.us_end,
+                        exchange_rate_usd_krw,
+                    )
+                except Exception:
+                    logger.exception("failed to refresh market sessions / exchange rate; will retry next tick")
+
+            if run_state.last_snapshot_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST:
+                try:
+                    daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw)
+                    run_state.last_snapshot_date = today_str
+                    run_state.save()
+                    active_rows = sheets.read_rows()
+                except Exception:
+                    logger.exception("daily snapshot failed, will retry next tick")
+
+            if not active_rows:
+                try:
+                    active_rows = sheets.read_rows()
+                except Exception:
+                    logger.exception("failed to read sheet rows; will retry next tick")
+
+            if time.monotonic() - last_fx_refresh > 60:
+                try:
+                    rate_resp = toss.get_exchange_rate("USD", "KRW")
+                    exchange_rate_usd_krw = Decimal(rate_resp["rate"])
+                except Exception:
+                    logger.exception("periodic exchange rate refresh failed, keeping previous value")
                 last_fx_refresh = time.monotonic()
-                sessions = load_market_sessions(toss)
-                logger.info(
-                    "sessions refreshed for %s: KR %s / US %s (USD/KRW=%s)",
-                    today_str,
-                    sessions.kr_windows,
-                    sessions.us_windows,
-                    exchange_rate_usd_krw,
-                )
-            except Exception:
-                logger.exception("failed to refresh market sessions / exchange rate; will retry next tick")
 
-        if run_state.last_snapshot_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST:
-            try:
-                daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw)
-                run_state.last_snapshot_date = today_str
-                run_state.save()
-                active_rows = sheets.read_rows()
-            except Exception:
-                logger.exception("daily snapshot failed, will retry next tick")
+            candidates = [r for r in active_rows if r.strategy_enabled and not r.liquidated]
+            market_open_now = candidates and sessions and (
+                is_market_open(sessions, Market.KR, now) or is_market_open(sessions, Market.US, now)
+            )
 
-        if not active_rows:
-            active_rows = sheets.read_rows()
+            if market_open_now:
+                items: dict[str, dict] = {}
+                holdings_ok = True
+                try:
+                    holdings = toss.get_holdings(account_seq)
+                    items = {i["symbol"]: i for i in holdings.get("items", [])}
+                except Exception:
+                    logger.exception("get_holdings failed this tick; skipping strategy processing")
+                    holdings_ok = False
 
-        if time.monotonic() - last_fx_refresh > 60:
-            try:
-                rate_resp = toss.get_exchange_rate("USD", "KRW")
-                exchange_rate_usd_krw = Decimal(rate_resp["rate"])
-            except Exception:
-                logger.exception("periodic exchange rate refresh failed, keeping previous value")
-            last_fx_refresh = time.monotonic()
-
-        candidates = [r for r in active_rows if r.strategy_enabled and not r.liquidated]
-        market_open_now = candidates and sessions and (
-            is_market_open(sessions, Market.KR, now) or is_market_open(sessions, Market.US, now)
-        )
-
-        if market_open_now:
-            items: dict[str, dict] = {}
-            holdings_ok = True
-            try:
-                holdings = toss.get_holdings(account_seq)
-                items = {i["symbol"]: i for i in holdings.get("items", [])}
-            except Exception:
-                logger.exception("get_holdings failed this tick; skipping strategy processing")
-                holdings_ok = False
-
-            if holdings_ok:
-                updates: list[tuple[int, str, str]] = []
-                for row in candidates:
-                    try:
-                        process_symbol(row, items.get(row.symbol), sessions, now, run_state, executor, exchange_rate_usd_krw, updates)
-                    except Exception:
-                        logger.exception("error processing %s; continuing with other symbols", row.symbol)
-                if updates:
-                    try:
-                        sheets.batch_write(updates)
-                    except Exception:
-                        logger.exception("sheet batch_write failed")
+                if holdings_ok:
+                    updates: list[tuple[int, str, str]] = []
+                    for row in candidates:
+                        try:
+                            process_symbol(row, items.get(row.symbol), sessions, now, run_state, today_str, executor, exchange_rate_usd_krw, updates)
+                        except Exception:
+                            logger.exception("error processing %s; continuing with other symbols", row.symbol)
+                    if updates:
+                        try:
+                            sheets.batch_write(updates)
+                        except Exception:
+                            logger.exception("sheet batch_write failed")
+        except Exception:
+            # Last-resort safety net: nothing above should reach here (each
+            # step already has its own try/except), but a genuinely
+            # unexpected error here must not kill the 24/7 process.
+            logger.exception("unhandled error in main loop tick; continuing")
 
         elapsed = time.monotonic() - loop_start
         time.sleep(max(0.0, TICK_SECONDS - elapsed))
