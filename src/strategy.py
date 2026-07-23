@@ -8,11 +8,9 @@ from __future__ import annotations
 from decimal import Decimal
 
 from src.config import (
-    FRACTIONAL_DAILY_BUY_KRW,
-    FRACTIONAL_RESUME_RATE,
-    FRACTIONAL_TARGET_KRW,
-    NONFRACTIONAL_BASE_RATE,
-    NONFRACTIONAL_STEP_RATE,
+    DAILY_BUY_KRW,
+    DAILY_BUY_RESUME_RATE,
+    DAILY_BUY_TARGET_KRW,
     PEAK_ACTIVATION_RATE,
     TAKE_PROFIT_BREAKPOINT,
     TAKE_PROFIT_HIGH_SLOPE,
@@ -47,40 +45,27 @@ def should_liquidate(peak: Decimal, current_rate: Decimal, threshold: Decimal) -
     return peak >= PEAK_ACTIVATION_RATE and current_rate <= threshold
 
 
-def fractional_daily_buy_amount_krw(
+def daily_buy_amount_krw(
     purchase_amount_krw: Decimal, current_rate: Decimal
 ) -> Decimal | None:
-    """Rules 4.1-4.3 for fractional-tradable symbols.
+    """Rule 4: once/day DCA buy target, in KRW.
 
     - Below the 100,000 KRW accumulation target: keep buying 5,000/day
       regardless of profit rate.
-    - At/above target: only keep buying 5,000/day while current_rate > 10%.
+    - At/above target: only keep buying 5,000/day while current_rate >= 10%.
       Once profitable, buying continues indefinitely (no re-cap).
     """
-    if purchase_amount_krw < FRACTIONAL_TARGET_KRW:
-        return Decimal(FRACTIONAL_DAILY_BUY_KRW)
-    if current_rate > FRACTIONAL_RESUME_RATE:
-        return Decimal(FRACTIONAL_DAILY_BUY_KRW)
+    if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
+        return Decimal(DAILY_BUY_KRW)
+    if current_rate >= DAILY_BUY_RESUME_RATE:
+        return Decimal(DAILY_BUY_KRW)
     return None
 
 
-def nonfractional_required_rate(held_qty: Decimal) -> Decimal:
-    """10% + (held_qty - 1) * 5%"""
-    return NONFRACTIONAL_BASE_RATE + (held_qty - 1) * NONFRACTIONAL_STEP_RATE
-
-
-def nonfractional_should_buy(held_qty: Decimal, current_rate: Decimal) -> bool:
-    """Rule 5.1: only add to an *existing* (held_qty >= 1) non-fractional
-    position, and only if current profit rate already clears the
-    quantity-scaled bar. A held_qty of 0 never buys (no manual seed position).
-    """
-    if held_qty < 1:
-        return False
-    return current_rate >= nonfractional_required_rate(held_qty)
-
-
-def peak_after_nonfractional_buy(rate_after_buy: Decimal) -> Decimal:
-    """Rule 5.2: on a non-fractional new buy, the peak is reassigned to the
-    rate resulting from the buy (not maxed against the prior peak).
+def peak_after_share_buy(rate_after_buy: Decimal) -> Decimal:
+    """When the amount-based buy fails and a single whole share is bought as
+    a fallback, the peak is reassigned to the rate resulting from that buy
+    (not maxed against the prior peak) -- a whole-share purchase can shift
+    the cost basis enough that the old peak/threshold no longer applies.
     """
     return rate_after_buy

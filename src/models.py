@@ -10,12 +10,6 @@ class Market(str, Enum):
     US = "US"
 
 
-class FractionalStatus(str, Enum):
-    UNKNOWN = ""
-    YES = "TRUE"
-    NO = "FALSE"
-
-
 @dataclass
 class HoldingSnapshot:
     """A single position as reported by GET /api/v1/holdings, converted to KRW."""
@@ -40,7 +34,6 @@ SHEET_COLUMNS = [
     "최고수익률",
     "익절기준",
     "청산여부",
-    "소수점가능여부",
     "마지막갱신",
 ]
 
@@ -58,7 +51,6 @@ class SheetRow:
     peak_rate: Decimal  # fraction
     take_profit_threshold: Decimal  # fraction
     liquidated: bool
-    fractional_status: FractionalStatus
     last_updated: str
 
     @staticmethod
@@ -87,6 +79,5 @@ class SheetRow:
             peak_rate=cls._dec(record.get("최고수익률", "0")) / Decimal(100),
             take_profit_threshold=cls._dec(record.get("익절기준", "-100")) / Decimal(100),
             liquidated=cls._bool(record.get("청산여부", "FALSE")),
-            fractional_status=FractionalStatus(str(record.get("소수점가능여부", "")).strip().upper()),
             last_updated=str(record.get("마지막갱신", "")).strip(),
         )

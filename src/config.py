@@ -65,11 +65,9 @@ class Config:
 # --- Strategy constants (from spec) ---
 from decimal import Decimal as _Decimal
 
-FRACTIONAL_DAILY_BUY_KRW = _Decimal("5000")
-FRACTIONAL_TARGET_KRW = _Decimal("100000")
-FRACTIONAL_RESUME_RATE = _Decimal("0.10")  # profit rate must exceed this to keep buying past target
-NONFRACTIONAL_BASE_RATE = _Decimal("0.10")
-NONFRACTIONAL_STEP_RATE = _Decimal("0.05")
+DAILY_BUY_KRW = _Decimal("5000")
+DAILY_BUY_TARGET_KRW = _Decimal("100000")
+DAILY_BUY_RESUME_RATE = _Decimal("0.10")  # profit rate must reach this to keep buying past target
 PEAK_ACTIVATION_RATE = _Decimal("0.10")
 # take-profit threshold once peak has activated:
 #   peak < TAKE_PROFIT_BREAKPOINT: threshold = peak * TAKE_PROFIT_LOW_SLOPE + TAKE_PROFIT_LOW_BASE

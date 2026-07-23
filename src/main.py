@@ -22,7 +22,7 @@ from pathlib import Path
 
 from src import strategy
 from src.config import DAILY_SNAPSHOT_HOUR_KST, KST, PROJECT_ROOT, STATE_FILE, TICK_SECONDS, Config
-from src.models import FractionalStatus, Market, SheetRow
+from src.models import Market, SheetRow
 from src.sheets_client import SheetsClient, fraction_to_percent_str
 from src.toss_client import OrderNotFilledError, TossApiError, TossClient
 
@@ -40,12 +40,8 @@ class RunState:
     def __init__(self, path: Path):
         self._path = path
         self.last_snapshot_date: str | None = None
-        # tracks the once/day fractional DCA attempt (rule 4)
+        # tracks the once/day DCA buy attempt (rule 4)
         self.daily_buys: dict[str, list[str]] = {}
-        # tracks the once/day whole-share add-on buy (rule 5), separate from
-        # daily_buys because it's only marked once an order actually fills --
-        # the condition itself is re-checked every tick until it does.
-        self.share_buys: dict[str, list[str]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -58,14 +54,12 @@ class RunState:
             return
         self.last_snapshot_date = data.get("last_snapshot_date")
         self.daily_buys = data.get("daily_buys", {})
-        self.share_buys = data.get("share_buys", {})
 
     def save(self) -> None:
         payload = json.dumps(
             {
                 "last_snapshot_date": self.last_snapshot_date,
                 "daily_buys": self.daily_buys,
-                "share_buys": self.share_buys,
             },
             ensure_ascii=False,
             indent=2,
@@ -97,14 +91,6 @@ class RunState:
     def mark_bought(self, date_str: str, symbol: str) -> None:
         self.daily_buys.setdefault(date_str, []).append(symbol)
         self._prune(self.daily_buys)
-        self.save()
-
-    def share_bought_today(self, date_str: str, symbol: str) -> bool:
-        return symbol in self.share_buys.get(date_str, [])
-
-    def mark_share_bought(self, date_str: str, symbol: str) -> None:
-        self.share_buys.setdefault(date_str, []).append(symbol)
-        self._prune(self.share_buys)
         self.save()
 
 
@@ -323,11 +309,7 @@ def _apply_trade_result(row: SheetRow, item: dict, exchange_rate_usd_krw: Decima
     updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
 
 
-def _is_fractional_unsupported_error(err: TossApiError) -> bool:
-    return err.code == "stock-restricted" and "소수" in (err.message or "")
-
-
-def _attempt_fractional_daily_buy(
+def _attempt_daily_buy(
     row: SheetRow,
     item: dict | None,
     current_rate: Decimal,
@@ -337,81 +319,58 @@ def _attempt_fractional_daily_buy(
     now: dt.datetime,
     updates: list,
 ) -> None:
-    """Rule 4: once/day, fixed 5,000 KRW fractional DCA buy for US symbols.
-    Runs once per day regardless of outcome -- the amount doesn't depend on
-    intraday rate movement, so re-checking more often would never buy more.
-    """
-    if row.market != Market.US or row.fractional_status == FractionalStatus.NO:
-        return
+    """Rule 4 (unified, market-agnostic): once/day DCA buy.
 
+    - purchase_amount_krw < 100,000: buy 5,000 KRW worth.
+    - purchase_amount_krw >= 100,000 and current_rate >= 10%: buy 5,000 KRW worth.
+    - otherwise: no buy today.
+
+    The 5,000 KRW order is placed as an amount order first (this only works
+    for symbols/brokers that support fractional shares). If that order
+    errors out for any reason, fall back to buying a single whole share --
+    the amount-buy's eligibility condition already holds, so the fallback
+    doesn't need to re-check it.
+    """
     purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw) if item else row.purchase_amount_krw
-    amount_krw = strategy.fractional_daily_buy_amount_krw(purchase_krw, current_rate)
+    amount_krw = strategy.daily_buy_amount_krw(purchase_krw, current_rate)
     if amount_krw is None:
         logger.debug(
-            "%s: no fractional buy today (target reached at %s KRW, rate %.4f not > 10%%)",
+            "%s: no buy today (purchase=%s KRW, rate %.4f below 10%% resume bar)",
             row.symbol, purchase_krw, current_rate,
         )
-        return  # target reached, profit <=10%: no buy today (rule 4.2)
+        return
 
-    order_amount_usd = (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
+    currency = "KRW" if row.market == Market.KR else "USD"
+    order_amount = amount_krw if currency == "KRW" else (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
     client_order_id = f"{today_str}-{row.symbol}-DCA"[:36]
     try:
         result = executor.buy(
             row.symbol,
-            "USD",
+            currency,
             "MARKET",
-            order_amount=order_amount_usd,
+            order_amount=order_amount,
             client_order_id=client_order_id,
             current_holding=item,
         )
-    except TossApiError as e:
-        if _is_fractional_unsupported_error(e):
-            row.fractional_status = FractionalStatus.NO
-            updates.append((row.row_number, "소수점가능여부", "FALSE"))
-            logger.info(
-                "%s: fractional not supported (%s); whole-share rule takes over from now on",
-                row.symbol, e.message,
-            )
-        else:
-            logger.warning("fractional buy failed for %s: %s", row.symbol, e)
-        return
-    except OrderNotFilledError as e:
-        logger.warning("fractional buy for %s did not fill (status=%s); will retry tomorrow", row.symbol, e.status)
+    except (TossApiError, OrderNotFilledError) as e:
+        logger.info("%s: amount buy failed (%s); falling back to 1-share buy", row.symbol, e)
+        _attempt_fallback_share_buy(row, item, executor, exchange_rate_usd_krw, today_str, now, updates)
         return
 
-    if row.fractional_status == FractionalStatus.UNKNOWN:
-        row.fractional_status = FractionalStatus.YES
-        updates.append((row.row_number, "소수점가능여부", "TRUE"))
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
-    logger.info("BUY(amount) %s target=%sKRW (%sUSD)", row.symbol, amount_krw, order_amount_usd)
+    logger.info("BUY(amount) %s target=%sKRW (%s%s)", row.symbol, amount_krw, order_amount, currency)
 
 
-def _attempt_nonfractional_buy(
+def _attempt_fallback_share_buy(
     row: SheetRow,
     item: dict | None,
-    held_qty: Decimal,
-    current_rate: Decimal,
     executor: OrderExecutor,
     exchange_rate_usd_krw: Decimal,
     today_str: str,
     now: dt.datetime,
     updates: list,
-) -> bool:
-    """Rule 5: whole-share add-on buy. The caller re-checks this every tick
-    (same cadence as the peak/threshold/liquidation check) while the day's
-    buy hasn't happened yet, so a rate that crosses the required bar at any
-    point during the session -- not just at market open -- triggers a market
-    order. Returns True iff an order actually filled.
-    """
-    if not strategy.nonfractional_should_buy(held_qty, current_rate):
-        required = strategy.nonfractional_required_rate(held_qty) if held_qty >= 1 else None
-        logger.debug(
-            "%s: whole-share buy condition not met (held_qty=%s rate=%.4f required=%s)",
-            row.symbol, held_qty, current_rate, required,
-        )
-        return False
-
-    client_order_id = f"{today_str}-{row.symbol}-ADD"[:36]
+) -> None:
+    client_order_id = f"{today_str}-{row.symbol}-DCA1"[:36]
     currency = "KRW" if row.market == Market.KR else "USD"
     try:
         result = executor.buy(
@@ -423,15 +382,14 @@ def _attempt_nonfractional_buy(
             current_holding=item,
         )
     except (TossApiError, OrderNotFilledError) as e:
-        logger.warning("whole-share buy failed for %s, will retry next tick: %s", row.symbol, e)
-        return False
+        logger.warning("fallback 1-share buy also failed for %s; will retry tomorrow: %s", row.symbol, e)
+        return
 
     new_rate = Decimal(result["profitLoss"]["rate"])
-    row.peak_rate = strategy.peak_after_nonfractional_buy(new_rate)
+    row.peak_rate = strategy.peak_after_share_buy(new_rate)
     updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
-    logger.info("BUY(1 share) %s new_rate=%.4f", row.symbol, new_rate)
-    return True
+    logger.info("BUY(1 share fallback) %s new_rate=%.4f", row.symbol, new_rate)
 
 
 def process_symbol(
@@ -454,7 +412,6 @@ def process_symbol(
 
     held = item is not None
     current_rate = Decimal(item["profitLoss"]["rate"]) if held else Decimal(0)
-    held_qty = Decimal(item["quantity"]) if held else Decimal(0)
 
     if held:
         new_peak, new_threshold = strategy.update_peak_and_threshold(row.peak_rate, current_rate, row.take_profit_threshold)
@@ -488,18 +445,12 @@ def process_symbol(
             logger.info("LIQUIDATED %s peak=%.4f rate=%.4f threshold=%.4f", row.symbol, new_peak, current_rate, new_threshold)
             return
 
-    # Rule 4 (fractional DCA): fixed amount, doesn't depend on intraday rate
-    # movement, so a once/day attempt is sufficient.
+    # Rule 4 (daily DCA buy): fixed target amount, doesn't depend on intraday
+    # rate movement beyond the once/day snapshot, so a once/day attempt is
+    # sufficient. Marked attempted regardless of outcome to avoid retry storms.
     if not run_state.bought_today(today_str, row.symbol):
-        run_state.mark_bought(today_str, row.symbol)  # mark attempted regardless of outcome; avoids retry storms on error
-        _attempt_fractional_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates)
-
-    # Rule 5 (whole-share add-on): re-checked every tick -- same cadence as
-    # the take-profit check above -- so a rate crossing the required bar at
-    # any point in the session triggers the market buy, not just at open.
-    if not run_state.share_bought_today(today_str, row.symbol):
-        if _attempt_nonfractional_buy(row, item, held_qty, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates):
-            run_state.mark_share_bought(today_str, row.symbol)
+        run_state.mark_bought(today_str, row.symbol)
+        _attempt_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates)
 
 
 # ---------------------------------------------------------------------------

@@ -94,7 +94,6 @@ class SheetsClient:
             "최고수익률": "0",
             "익절기준": "-100",
             "청산여부": "FALSE",
-            "소수점가능여부": "",
             "마지막갱신": now,
         }
         # value_input_option="RAW" is deliberate: "USER_ENTERED" makes Sheets

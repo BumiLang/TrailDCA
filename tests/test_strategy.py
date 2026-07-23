@@ -55,31 +55,22 @@ class TestShouldLiquidate:
         assert strategy.should_liquidate(D("0.60"), D("0.25"), D("0.20")) is False
 
 
-class TestFractionalDailyBuy:
+class TestDailyBuyAmount:
     def test_buys_while_under_target_regardless_of_rate(self):
-        assert strategy.fractional_daily_buy_amount_krw(D("0"), D("-0.50")) == D("5000")
-        assert strategy.fractional_daily_buy_amount_krw(D("95000"), D("-0.90")) == D("5000")
+        assert strategy.daily_buy_amount_krw(D("0"), D("-0.50")) == D("5000")
+        assert strategy.daily_buy_amount_krw(D("95000"), D("-0.90")) == D("5000")
 
-    def test_pauses_at_target_when_unprofitable(self):
-        assert strategy.fractional_daily_buy_amount_krw(D("100000"), D("0.05")) is None
-        assert strategy.fractional_daily_buy_amount_krw(D("100000"), D("0.10")) is None  # not strictly > 10%
+    def test_pauses_at_target_when_below_resume_rate(self):
+        assert strategy.daily_buy_amount_krw(D("100000"), D("0.05")) is None
+        assert strategy.daily_buy_amount_krw(D("100000"), D("0.09")) is None
+
+    def test_resumes_at_target_once_rate_reaches_10pct(self):
+        assert strategy.daily_buy_amount_krw(D("100000"), D("0.10")) == D("5000")
 
     def test_resumes_past_target_once_profitable(self):
-        assert strategy.fractional_daily_buy_amount_krw(D("150000"), D("0.11")) == D("5000")
+        assert strategy.daily_buy_amount_krw(D("150000"), D("0.11")) == D("5000")
 
 
-class TestNonfractionalBuy:
-    def test_never_buys_from_zero(self):
-        assert strategy.nonfractional_should_buy(D("0"), D("0.99")) is False
-
-    def test_requires_10pct_for_first_add(self):
-        assert strategy.nonfractional_should_buy(D("1"), D("0.09")) is False
-        assert strategy.nonfractional_should_buy(D("1"), D("0.10")) is True
-
-    def test_scales_5pct_per_additional_share(self):
-        # held 2 shares -> requires 15%
-        assert strategy.nonfractional_should_buy(D("2"), D("0.14")) is False
-        assert strategy.nonfractional_should_buy(D("2"), D("0.15")) is True
-
+class TestPeakAfterShareBuy:
     def test_peak_reassigned_after_buy(self):
-        assert strategy.peak_after_nonfractional_buy(D("0.12")) == D("0.12")
+        assert strategy.peak_after_share_buy(D("0.12")) == D("0.12")
