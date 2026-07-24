@@ -68,6 +68,7 @@ from decimal import Decimal as _Decimal
 DAILY_BUY_KRW = _Decimal("5000")
 DAILY_BUY_TARGET_KRW = _Decimal("100000")
 DAILY_BUY_RESUME_RATE = _Decimal("0.10")  # profit rate must reach this to keep buying past target
+DAILY_BUY_RETRY_SECONDS = 60  # throttle interval between buy attempts until one actually fills
 PEAK_ACTIVATION_RATE = _Decimal("0.10")
 # take-profit threshold once peak has activated:
 #   peak < TAKE_PROFIT_BREAKPOINT: threshold = peak * TAKE_PROFIT_LOW_SLOPE + TAKE_PROFIT_LOW_BASE

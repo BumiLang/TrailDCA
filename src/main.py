@@ -21,7 +21,16 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from src import strategy
-from src.config import DAILY_SNAPSHOT_HOUR_KST, KST, PROJECT_ROOT, STATE_FILE, TICK_SECONDS, Config
+from src.config import (
+    DAILY_BUY_RETRY_SECONDS,
+    DAILY_SNAPSHOT_HOUR_KST,
+    INITIAL_TAKE_PROFIT_THRESHOLD,
+    KST,
+    PROJECT_ROOT,
+    STATE_FILE,
+    TICK_SECONDS,
+    Config,
+)
 from src.models import Market, SheetRow
 from src.sheets_client import SheetsClient, fraction_to_percent_str
 from src.toss_client import OrderNotFilledError, TossApiError, TossClient
@@ -40,8 +49,13 @@ class RunState:
     def __init__(self, path: Path):
         self._path = path
         self.last_snapshot_date: str | None = None
-        # tracks the once/day DCA buy attempt (rule 4)
+        # tracks the daily DCA buy SUCCESS per (date, symbol) -- rule 4 keeps
+        # retrying until this is set, not just until one attempt was made
         self.daily_buys: dict[str, list[str]] = {}
+        # last buy-attempt timestamp per (date, symbol), used to throttle
+        # retries after a failed/unfilled attempt to once every
+        # DAILY_BUY_RETRY_SECONDS instead of hammering every tick
+        self.daily_buy_attempts: dict[str, dict[str, str]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -54,12 +68,14 @@ class RunState:
             return
         self.last_snapshot_date = data.get("last_snapshot_date")
         self.daily_buys = data.get("daily_buys", {})
+        self.daily_buy_attempts = data.get("daily_buy_attempts", {})
 
     def save(self) -> None:
         payload = json.dumps(
             {
                 "last_snapshot_date": self.last_snapshot_date,
                 "daily_buys": self.daily_buys,
+                "daily_buy_attempts": self.daily_buy_attempts,
             },
             ensure_ascii=False,
             indent=2,
@@ -81,7 +97,7 @@ class RunState:
                 time.sleep(0.1 * (attempt + 1))
 
     @staticmethod
-    def _prune(buys: dict[str, list[str]], keep: int = 3) -> None:
+    def _prune(buys: dict[str, object], keep: int = 3) -> None:
         for old_date in sorted(buys)[:-keep] if len(buys) > keep else []:
             del buys[old_date]
 
@@ -93,11 +109,25 @@ class RunState:
         self._prune(self.daily_buys)
         self.save()
 
+    def seconds_since_last_buy_attempt(self, date_str: str, symbol: str, now: dt.datetime) -> float | None:
+        iso = self.daily_buy_attempts.get(date_str, {}).get(symbol)
+        if iso is None:
+            return None
+        return (now - dt.datetime.fromisoformat(iso)).total_seconds()
+
+    def mark_buy_attempt(self, date_str: str, symbol: str, now: dt.datetime) -> None:
+        self.daily_buy_attempts.setdefault(date_str, {})[symbol] = now.isoformat(timespec="seconds")
+        self._prune(self.daily_buy_attempts)
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 # Market sessions (regular-hours windows), refreshed once/day at/after 08:00
-# KST -- late enough that the previous US regular session (which can spill
-# past midnight KST) has already ended.
+# KST, and refreshed immediately on service startup at any hour. The US
+# regular session can spill past midnight KST, so a startup between 00:00
+# and market close still needs to recognize an overnight session that
+# started the previous business day -- us_prev_start/us_prev_end carry that
+# session forward (from the same market-calendar response, no extra call).
 # ---------------------------------------------------------------------------
 
 
@@ -108,6 +138,8 @@ class MarketSessions:
     kr_end: dt.datetime | None
     us_start: dt.datetime | None
     us_end: dt.datetime | None
+    us_prev_start: dt.datetime | None
+    us_prev_end: dt.datetime | None
 
 
 def _parse_session(session: dict | None) -> tuple[dt.datetime | None, dt.datetime | None]:
@@ -124,17 +156,38 @@ def load_market_sessions(toss: TossClient) -> MarketSessions:
     kr_integrated = (kr.get("today") or {}).get("integrated") or {}
     kr_start, kr_end = _parse_session(kr_integrated.get("regularMarket"))
     us_start, us_end = _parse_session((us.get("today") or {}).get("regularMarket"))
+    us_prev_start, us_prev_end = _parse_session((us.get("previousBusinessDay") or {}).get("regularMarket"))
 
-    return MarketSessions(today, kr_start, kr_end, us_start, us_end)
+    return MarketSessions(today, kr_start, kr_end, us_start, us_end, us_prev_start, us_prev_end)
 
 
 def is_market_open(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> bool:
     if sessions is None:
         return False
-    start, end = (sessions.kr_start, sessions.kr_end) if market == Market.KR else (sessions.us_start, sessions.us_end)
-    if start is None or end is None:
-        return False
-    return start <= now < end
+    if market == Market.KR:
+        candidates = [(sessions.kr_start, sessions.kr_end)]
+    else:
+        # today's US session, or yesterday's overnight session if it hasn't
+        # ended yet (e.g. a 00:00-05:00 KST startup during last night's run)
+        candidates = [(sessions.us_start, sessions.us_end), (sessions.us_prev_start, sessions.us_prev_end)]
+    return any(start is not None and end is not None and start <= now < end for start, end in candidates)
+
+
+def _trading_day_key(market: Market, sessions: MarketSessions, now: dt.datetime) -> str:
+    """Calendar-date key for once/day gating (e.g. the daily DCA buy).
+
+    KR sessions never cross midnight KST, so today's date is unambiguous.
+    A US session that started ~22:30 KST can still be open past midnight;
+    if we keyed once/day tracking by `now.date()` directly, the key would
+    flip mid-session and the same continuous session would look like a new
+    day, letting the daily buy fire twice (once before midnight, once
+    after). Keep using the date the *currently open* session started on.
+    """
+    if market != Market.US:
+        return now.date().isoformat()
+    if sessions.us_prev_start is not None and sessions.us_prev_end is not None and sessions.us_prev_start <= now < sessions.us_prev_end:
+        return sessions.us_prev_start.date().isoformat()
+    return now.date().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +260,9 @@ class OrderExecutor:
             cost = quantity * price
         sim["quantity"] += bought_qty
         sim["purchase_amount"] += cost
-        rate = (sim["quantity"] * price - sim["purchase_amount"]) / sim["purchase_amount"]
+        valuation = sim["quantity"] * price
+        profit_amount = valuation - sim["purchase_amount"]
+        rate = profit_amount / sim["purchase_amount"]
         logger.info(
             "[DRY-RUN] BUY %s type=%s qty=%s amount=%s price=%s -> sim_qty=%s sim_rate=%.4f",
             symbol,
@@ -222,8 +277,8 @@ class OrderExecutor:
             "symbol": symbol,
             "quantity": str(sim["quantity"]),
             "currency": currency,
-            "marketValue": {"purchaseAmount": str(sim["purchase_amount"])},
-            "profitLoss": {"rate": str(rate)},
+            "marketValue": {"purchaseAmount": str(sim["purchase_amount"]), "amount": str(valuation)},
+            "profitLoss": {"rate": str(rate), "amount": str(profit_amount)},
         }
 
     def liquidate(self, symbol: str, client_order_id: str = "") -> None:
@@ -246,12 +301,30 @@ class OrderExecutor:
 
 
 # ---------------------------------------------------------------------------
-# Daily snapshot (spec 1 + 2): pull real holdings, reconcile into the sheet.
+# Holdings sync (on service startup, and once/day thereafter): pull real
+# holdings and reconcile into the sheet. Existing rows only get their live
+# fields (quantity/purchase/rate/timestamp) refreshed -- symbols in the
+# sheet but no longer held are left untouched. New holdings not yet in the
+# sheet are appended with default strategy state.
 # ---------------------------------------------------------------------------
 
 
 def _purchase_amount_krw(item: dict, exchange_rate_usd_krw: Decimal) -> Decimal:
     amount = Decimal(item["marketValue"]["purchaseAmount"])
+    if item.get("currency") == "KRW":
+        return amount
+    return amount * exchange_rate_usd_krw
+
+
+def _valuation_amount_krw(item: dict, exchange_rate_usd_krw: Decimal) -> Decimal:
+    amount = Decimal(item["marketValue"]["amount"])
+    if item.get("currency") == "KRW":
+        return amount
+    return amount * exchange_rate_usd_krw
+
+
+def _profit_amount_krw(item: dict, exchange_rate_usd_krw: Decimal) -> Decimal:
+    amount = Decimal(item["profitLoss"]["amount"])
     if item.get("currency") == "KRW":
         return amount
     return amount * exchange_rate_usd_krw
@@ -265,6 +338,7 @@ def daily_snapshot(
     existing = {r.symbol: r for r in sheets.read_rows()}
 
     updates: list[tuple[int, str, str]] = []
+    new_rows: list[dict] = []
     now_iso = dt.datetime.now(KST).isoformat(timespec="seconds")
 
     for item in items:
@@ -272,25 +346,40 @@ def daily_snapshot(
         quantity = Decimal(item["quantity"])
         rate = Decimal(item["profitLoss"]["rate"])
         purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
+        valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
+        profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
 
         if symbol in existing:
             row = existing[symbol]
             updates.append((row.row_number, "보유수량", str(quantity)))
             updates.append((row.row_number, "매입금액_원화", str(purchase_krw.quantize(Decimal("1")))))
+            updates.append((row.row_number, "평가금액_원화", str(valuation_krw.quantize(Decimal("1")))))
+            updates.append((row.row_number, "평가손익_원화", str(profit_krw.quantize(Decimal("1")))))
             updates.append((row.row_number, "수익률", fraction_to_percent_str(rate)))
             updates.append((row.row_number, "마지막갱신", now_iso))
         else:
-            sheets.append_default_row(
-                symbol,
-                item.get("name", ""),
-                item.get("marketCountry", "KR"),
+            # 최고수익률 seeds to the current rate (no tracked history yet);
+            # 익절기준 is derived from that same peak via the normal
+            # trailing-stop formula, not hardcoded, so a newly-synced holding
+            # that's already well above the 10% activation bar gets a real
+            # take-profit floor instead of the inert -100% default.
+            _, threshold = strategy.update_peak_and_threshold(rate, rate, INITIAL_TAKE_PROFIT_THRESHOLD)
+            new_rows.append(dict(
+                symbol=symbol,
+                name=item.get("name", ""),
+                market=item.get("marketCountry", "KR"),
                 quantity=str(quantity),
                 purchase_amount_krw=str(purchase_krw.quantize(Decimal("1"))),
+                valuation_amount_krw=str(valuation_krw.quantize(Decimal("1"))),
+                profit_amount_krw=str(profit_krw.quantize(Decimal("1"))),
                 profit_rate_pct=fraction_to_percent_str(rate),
-            )
+                peak_rate_pct=fraction_to_percent_str(rate),
+                take_profit_threshold_pct=fraction_to_percent_str(threshold),
+            ))
             logger.info("new holding discovered, added to sheet: %s", symbol)
 
     sheets.batch_write(updates)
+    sheets.append_default_rows(new_rows)
     logger.info("daily snapshot reconciled %d holdings", len(items))
 
 
@@ -302,9 +391,13 @@ def daily_snapshot(
 def _apply_trade_result(row: SheetRow, item: dict, exchange_rate_usd_krw: Decimal, now: dt.datetime, updates: list) -> None:
     row.quantity = Decimal(item["quantity"])
     row.purchase_amount_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
+    row.valuation_amount_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
+    row.profit_amount_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
     row.profit_rate = Decimal(item["profitLoss"]["rate"])
     updates.append((row.row_number, "보유수량", str(row.quantity)))
     updates.append((row.row_number, "매입금액_원화", str(row.purchase_amount_krw.quantize(Decimal("1")))))
+    updates.append((row.row_number, "평가금액_원화", str(row.valuation_amount_krw.quantize(Decimal("1")))))
+    updates.append((row.row_number, "평가손익_원화", str(row.profit_amount_krw.quantize(Decimal("1")))))
     updates.append((row.row_number, "수익률", fraction_to_percent_str(row.profit_rate)))
     updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
 
@@ -318,27 +411,30 @@ def _attempt_daily_buy(
     today_str: str,
     now: dt.datetime,
     updates: list,
-) -> None:
-    """Rule 4 (unified, market-agnostic): once/day DCA buy.
+) -> bool:
+    """Rule 4 (unified, market-agnostic): DCA buy, retried until it fills.
 
     - purchase_amount_krw < 100,000: buy 5,000 KRW worth.
     - purchase_amount_krw >= 100,000 and current_rate >= 10%: buy 5,000 KRW worth.
-    - otherwise: no buy today.
+    - otherwise: no buy right now.
 
     The 5,000 KRW order is placed as an amount order first (this only works
     for symbols/brokers that support fractional shares). If that order
     errors out for any reason, fall back to buying a single whole share --
     the amount-buy's eligibility condition already holds, so the fallback
     doesn't need to re-check it.
+
+    Returns True iff an order actually filled -- the caller only stops
+    retrying (throttled to DAILY_BUY_RETRY_SECONDS) once this is True.
     """
     purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw) if item else row.purchase_amount_krw
     amount_krw = strategy.daily_buy_amount_krw(purchase_krw, current_rate)
     if amount_krw is None:
         logger.debug(
-            "%s: no buy today (purchase=%s KRW, rate %.4f below 10%% resume bar)",
+            "%s: no buy right now (purchase=%s KRW, rate %.4f below 10%% resume bar)",
             row.symbol, purchase_krw, current_rate,
         )
-        return
+        return False
 
     currency = "KRW" if row.market == Market.KR else "USD"
     order_amount = amount_krw if currency == "KRW" else (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
@@ -354,11 +450,11 @@ def _attempt_daily_buy(
         )
     except (TossApiError, OrderNotFilledError) as e:
         logger.info("%s: amount buy failed (%s); falling back to 1-share buy", row.symbol, e)
-        _attempt_fallback_share_buy(row, item, executor, exchange_rate_usd_krw, today_str, now, updates)
-        return
+        return _attempt_fallback_share_buy(row, item, executor, exchange_rate_usd_krw, today_str, now, updates)
 
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
     logger.info("BUY(amount) %s target=%sKRW (%s%s)", row.symbol, amount_krw, order_amount, currency)
+    return True
 
 
 def _attempt_fallback_share_buy(
@@ -369,7 +465,7 @@ def _attempt_fallback_share_buy(
     today_str: str,
     now: dt.datetime,
     updates: list,
-) -> None:
+) -> bool:
     client_order_id = f"{today_str}-{row.symbol}-DCA1"[:36]
     currency = "KRW" if row.market == Market.KR else "USD"
     try:
@@ -382,14 +478,15 @@ def _attempt_fallback_share_buy(
             current_holding=item,
         )
     except (TossApiError, OrderNotFilledError) as e:
-        logger.warning("fallback 1-share buy also failed for %s; will retry tomorrow: %s", row.symbol, e)
-        return
+        logger.warning("fallback 1-share buy also failed for %s; will retry in %ds: %s", row.symbol, DAILY_BUY_RETRY_SECONDS, e)
+        return False
 
     new_rate = Decimal(result["profitLoss"]["rate"])
     row.peak_rate = strategy.peak_after_share_buy(new_rate)
     updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
     logger.info("BUY(1 share fallback) %s new_rate=%.4f", row.symbol, new_rate)
+    return True
 
 
 def process_symbol(
@@ -403,8 +500,8 @@ def process_symbol(
     exchange_rate_usd_krw: Decimal,
     updates: list,
 ) -> None:
-    if not row.strategy_enabled or row.liquidated:
-        logger.debug("%s skipped: strategy_enabled=%s liquidated=%s", row.symbol, row.strategy_enabled, row.liquidated)
+    if row.liquidated:
+        logger.debug("%s skipped: liquidated", row.symbol)
         return
     if not is_market_open(sessions, row.market, now):
         logger.debug("%s skipped: %s market closed", row.symbol, row.market.value)
@@ -412,6 +509,27 @@ def process_symbol(
 
     held = item is not None
     current_rate = Decimal(item["profitLoss"]["rate"]) if held else Decimal(0)
+
+    if held:
+        # Live mirror of the real position, refreshed every tick regardless
+        # of 전략적용여부 -- the sheet should always reflect the actual
+        # account even for symbols the strategy isn't actively managing.
+        purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
+        valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
+        profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
+        row.quantity = Decimal(item["quantity"])
+        row.purchase_amount_krw = purchase_krw
+        row.valuation_amount_krw = valuation_krw
+        row.profit_amount_krw = profit_krw
+        updates.append((row.row_number, "보유수량", str(row.quantity)))
+        updates.append((row.row_number, "매입금액_원화", str(purchase_krw.quantize(Decimal("1")))))
+        updates.append((row.row_number, "평가금액_원화", str(valuation_krw.quantize(Decimal("1")))))
+        updates.append((row.row_number, "평가손익_원화", str(profit_krw.quantize(Decimal("1")))))
+        updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
+
+    if not row.strategy_enabled:
+        logger.debug("%s skipped: strategy_enabled=False", row.symbol)
+        return
 
     if held:
         new_peak, new_threshold = strategy.update_peak_and_threshold(row.peak_rate, current_rate, row.take_profit_threshold)
@@ -437,20 +555,31 @@ def process_symbol(
                 return
             row.quantity = Decimal(0)
             row.purchase_amount_krw = Decimal(0)
+            row.valuation_amount_krw = Decimal(0)
+            row.profit_amount_krw = Decimal(0)
             row.liquidated = True
             updates.append((row.row_number, "보유수량", "0"))
             updates.append((row.row_number, "매입금액_원화", "0"))
+            updates.append((row.row_number, "평가금액_원화", "0"))
+            updates.append((row.row_number, "평가손익_원화", "0"))
             updates.append((row.row_number, "청산여부", "TRUE"))
             updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
             logger.info("LIQUIDATED %s peak=%.4f rate=%.4f threshold=%.4f", row.symbol, new_peak, current_rate, new_threshold)
             return
 
-    # Rule 4 (daily DCA buy): fixed target amount, doesn't depend on intraday
-    # rate movement beyond the once/day snapshot, so a once/day attempt is
-    # sufficient. Marked attempted regardless of outcome to avoid retry storms.
-    if not run_state.bought_today(today_str, row.symbol):
-        run_state.mark_bought(today_str, row.symbol)
-        _attempt_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, today_str, now, updates)
+    # Rule 4 (daily DCA buy): judged by success, not by attempt -- keeps
+    # retrying (throttled to DAILY_BUY_RETRY_SECONDS) until an order actually
+    # fills, rather than giving up for the day after a single failure.
+    # Keyed by the session's trading day (not the raw KST calendar date) so
+    # an overnight US session isn't double-counted across the midnight
+    # boundary.
+    buy_day_key = _trading_day_key(row.market, sessions, now)
+    if not run_state.bought_today(buy_day_key, row.symbol):
+        elapsed = run_state.seconds_since_last_buy_attempt(buy_day_key, row.symbol, now)
+        if elapsed is None or elapsed >= DAILY_BUY_RETRY_SECONDS:
+            run_state.mark_buy_attempt(buy_day_key, row.symbol, now)
+            if _attempt_daily_buy(row, item, current_rate, executor, exchange_rate_usd_krw, buy_day_key, now, updates):
+                run_state.mark_bought(buy_day_key, row.symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +629,7 @@ def main() -> None:
     exchange_rate_usd_krw = Decimal("1300")  # seed; refreshed before first real use below
     active_rows: list[SheetRow] = []
     last_fx_refresh = 0.0
+    startup_synced = False
 
     stop = {"flag": False}
 
@@ -534,12 +664,16 @@ def main() -> None:
                 except Exception:
                     logger.exception("failed to refresh market sessions / exchange rate; will retry next tick")
 
-            if run_state.last_snapshot_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST:
+            # Sync on service startup (regardless of time) and once/day at/after
+            # 08:00 KST thereafter -- startup_synced short-circuits the second
+            # check on the same day a startup sync already covered it.
+            if not startup_synced or (run_state.last_snapshot_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST):
                 try:
                     daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw)
                     run_state.last_snapshot_date = today_str
                     run_state.save()
                     active_rows = sheets.read_rows()
+                    startup_synced = True
                 except Exception:
                     logger.exception("daily snapshot failed, will retry next tick")
 
@@ -557,7 +691,10 @@ def main() -> None:
                     logger.exception("periodic exchange rate refresh failed, keeping previous value")
                 last_fx_refresh = time.monotonic()
 
-            candidates = [r for r in active_rows if r.strategy_enabled and not r.liquidated]
+            # Includes strategy_enabled=False rows too -- process_symbol still
+            # mirrors 보유수량/매입금액_원화/마지막갱신 for those every tick,
+            # it just skips the peak/threshold/buy logic for them.
+            candidates = [r for r in active_rows if not r.liquidated]
             market_open_now = candidates and sessions and (
                 is_market_open(sessions, Market.KR, now) or is_market_open(sessions, Market.US, now)
             )
