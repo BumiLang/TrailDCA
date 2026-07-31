@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -98,6 +99,32 @@ class TossClient:
         self._access_token: str | None = None
         self._token_expires_at: float = 0.0
 
+        # Local machine clock vs. Toss server clock, derived from each
+        # response's HTTP Date header. Keeps updating on every request so it
+        # self-corrects for local clock drift over a long-running process.
+        self._clock_offset = dt.timedelta(0)
+
+    def _update_clock_offset(self, resp: requests.Response) -> None:
+        date_header = resp.headers.get("Date")
+        if not date_header:
+            return
+        try:
+            server_time = parsedate_to_datetime(date_header)
+            if server_time.tzinfo is None:
+                server_time = server_time.replace(tzinfo=dt.timezone.utc)
+        except (TypeError, ValueError):
+            return
+        self._clock_offset = server_time - dt.datetime.now(dt.timezone.utc)
+
+    def now(self) -> dt.datetime:
+        """Current time in KST, corrected for local-vs-server clock skew.
+
+        Falls back to the plain local clock until the first API response is
+        seen. Callers that gate order timing on "time since market open"
+        should use this instead of dt.datetime.now(KST) directly, since a
+        skewed local clock would otherwise shift that window."""
+        return dt.datetime.now(KST) + self._clock_offset
+
     # ---- auth ----
 
     def _ensure_token(self) -> str:
@@ -114,6 +141,7 @@ class TossClient:
             },
             timeout=self._timeout,
         )
+        self._update_clock_offset(resp)
         if resp.status_code >= 400:
             self._raise_for_error(resp)
         payload = resp.json()
@@ -161,6 +189,7 @@ class TossClient:
             json=json_body,
             timeout=self._timeout,
         )
+        self._update_clock_offset(resp)
         if resp.status_code >= 400:
             self._raise_for_error(resp)
         body = resp.json()

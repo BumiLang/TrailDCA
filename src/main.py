@@ -25,10 +25,16 @@ from src.config import (
     DAILY_BUY_RETRY_SECONDS,
     DAILY_SNAPSHOT_HOUR_KST,
     INITIAL_TAKE_PROFIT_THRESHOLD,
+    KR_BUY_DELAY_AFTER_OPEN,
+    KR_SELL_DELAY_AFTER_OPEN,
     KST,
+    PEAK_ACTIVATION_RATE,
     PROJECT_ROOT,
+    SHEET_FLUSH_INTERVAL_SECONDS,
     STATE_FILE,
     TICK_SECONDS,
+    US_BUY_DELAY_AFTER_OPEN,
+    US_SELL_DELAY_AFTER_OPEN,
     Config,
 )
 from src.models import Market, SheetRow
@@ -149,7 +155,7 @@ def _parse_session(session: dict | None) -> tuple[dt.datetime | None, dt.datetim
 
 
 def load_market_sessions(toss: TossClient) -> MarketSessions:
-    today = dt.datetime.now(KST).date().isoformat()
+    today = toss.now().date().isoformat()
     kr = toss.get_market_calendar("KR")
     us = toss.get_market_calendar("US")
 
@@ -161,16 +167,30 @@ def load_market_sessions(toss: TossClient) -> MarketSessions:
     return MarketSessions(today, kr_start, kr_end, us_start, us_end, us_prev_start, us_prev_end)
 
 
-def is_market_open(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> bool:
+def _current_session_start(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> dt.datetime | None:
+    """Start time of the session currently open for `market`, or None if closed.
+
+    For US, checks both today's session and yesterday's overnight session
+    (still relevant if it hasn't ended yet, e.g. a 00:00-05:00 KST startup
+    during last night's run) and returns whichever one `now` actually falls
+    inside -- this is the single source of truth `is_market_open` and
+    `_trading_day_key` both build on, so they can never disagree about which
+    session (and therefore which session start) is currently active.
+    """
     if sessions is None:
-        return False
+        return None
     if market == Market.KR:
         candidates = [(sessions.kr_start, sessions.kr_end)]
     else:
-        # today's US session, or yesterday's overnight session if it hasn't
-        # ended yet (e.g. a 00:00-05:00 KST startup during last night's run)
         candidates = [(sessions.us_start, sessions.us_end), (sessions.us_prev_start, sessions.us_prev_end)]
-    return any(start is not None and end is not None and start <= now < end for start, end in candidates)
+    for start, end in candidates:
+        if start is not None and end is not None and start <= now < end:
+            return start
+    return None
+
+
+def is_market_open(sessions: MarketSessions | None, market: Market, now: dt.datetime) -> bool:
+    return _current_session_start(sessions, market, now) is not None
 
 
 def _trading_day_key(market: Market, sessions: MarketSessions, now: dt.datetime) -> str:
@@ -185,8 +205,9 @@ def _trading_day_key(market: Market, sessions: MarketSessions, now: dt.datetime)
     """
     if market != Market.US:
         return now.date().isoformat()
-    if sessions.us_prev_start is not None and sessions.us_prev_end is not None and sessions.us_prev_start <= now < sessions.us_prev_end:
-        return sessions.us_prev_start.date().isoformat()
+    start = _current_session_start(sessions, Market.US, now)
+    if start is not None:
+        return start.date().isoformat()
     return now.date().isoformat()
 
 
@@ -203,7 +224,7 @@ class OrderExecutor:
         self._live = live
         self._sim: dict[str, dict] = {}
 
-    def _current_price(self, symbol: str) -> Decimal:
+    def current_price(self, symbol: str) -> Decimal:
         prices = self._toss.get_prices([symbol])
         return Decimal(prices[0]["lastPrice"])
 
@@ -250,7 +271,7 @@ class OrderExecutor:
                 }
             else:
                 self._sim[symbol] = {"quantity": Decimal(0), "purchase_amount": Decimal(0)}
-        price = self._current_price(symbol)
+        price = self.current_price(symbol)
         sim = self._sim[symbol]
         if order_amount is not None:
             bought_qty = order_amount / price
@@ -422,7 +443,9 @@ def _attempt_daily_buy(
     for symbols/brokers that support fractional shares). If that order
     errors out for any reason, fall back to buying a single whole share --
     the amount-buy's eligibility condition already holds, so the fallback
-    doesn't need to re-check it.
+    doesn't need to re-check it, though it applies its own extra entry-rate
+    gate (see _attempt_fallback_share_buy) since a whole-share buy resets
+    peak/threshold on every fill, not just the first one.
 
     Returns True iff an order actually filled -- the caller only stops
     retrying (throttled to DAILY_BUY_RETRY_SECONDS) once this is True.
@@ -466,6 +489,34 @@ def _attempt_fallback_share_buy(
     now: dt.datetime,
     updates: list,
 ) -> bool:
+    """1-share fallback for symbols that don't support fractional-amount
+    orders. Every DCA-buy day for such a symbol goes through this path (the
+    amount order fails every time), and each fill unconditionally resets
+    peak_rate to that day's rate (see peak_after_share_buy below) rather
+    than maxing it -- so unlike the amount-order path, this only fires while
+    the rate that would RESULT from adding this 1 share (not the current,
+    pre-buy rate) is already at/above both the 10% activation floor and the
+    currently active take-profit threshold. Buying 1 more share at the
+    current price pulls the average cost basis up toward that price, which
+    pulls the profit rate down -- gating on the projected post-buy rate
+    keeps that dip from landing at/below the trailing stop right as it's
+    reset. Assumes the symbol is already held by the time this strategy
+    manages it (first entry into a symbol is done manually, outside this
+    bot)."""
+    price = executor.current_price(row.symbol)
+    projected_quantity = Decimal(item["quantity"]) + Decimal(1)
+    projected_purchase_amount = Decimal(item["marketValue"]["purchaseAmount"]) + price
+    projected_valuation = projected_quantity * price
+    projected_rate = (projected_valuation - projected_purchase_amount) / projected_purchase_amount
+
+    entry_floor = max(PEAK_ACTIVATION_RATE, row.take_profit_threshold)
+    if projected_rate < entry_floor:
+        logger.debug(
+            "%s: skipping 1-share fallback buy, post-buy rate %.4f below entry floor %.4f (max of 10%% activation and current take-profit threshold)",
+            row.symbol, projected_rate, entry_floor,
+        )
+        return False
+
     client_order_id = f"{today_str}-{row.symbol}-DCA1"[:36]
     currency = "KRW" if row.market == Market.KR else "USD"
     try:
@@ -503,9 +554,21 @@ def process_symbol(
     if row.liquidated:
         logger.debug("%s skipped: liquidated", row.symbol)
         return
-    if not is_market_open(sessions, row.market, now):
+    session_start = _current_session_start(sessions, row.market, now)
+    if session_start is None:
         logger.debug("%s skipped: %s market closed", row.symbol, row.market.value)
         return
+    # Buy/sell orders only start once the session has been open this long --
+    # peak/threshold bookkeeping below still runs from the open so the
+    # threshold is already accurate once orders are allowed to fire. Delay
+    # is configurable independently per market and per side.
+    if row.market == Market.KR:
+        buy_delay, sell_delay = KR_BUY_DELAY_AFTER_OPEN, KR_SELL_DELAY_AFTER_OPEN
+    else:
+        buy_delay, sell_delay = US_BUY_DELAY_AFTER_OPEN, US_SELL_DELAY_AFTER_OPEN
+    since_open = now - session_start
+    buy_allowed = since_open >= buy_delay
+    sell_allowed = since_open >= sell_delay
 
     held = item is not None
     current_rate = Decimal(item["profitLoss"]["rate"]) if held else Decimal(0)
@@ -543,7 +606,7 @@ def process_symbol(
             strategy.should_liquidate(new_peak, current_rate, new_threshold),
         )
 
-        if strategy.should_liquidate(new_peak, current_rate, new_threshold):
+        if sell_allowed and strategy.should_liquidate(new_peak, current_rate, new_threshold):
             client_order_id = f"{today_str}-{row.symbol}-EXIT"[:36]
             try:
                 executor.liquidate(row.symbol, client_order_id=client_order_id)
@@ -566,6 +629,10 @@ def process_symbol(
             updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
             logger.info("LIQUIDATED %s peak=%.4f rate=%.4f threshold=%.4f", row.symbol, new_peak, current_rate, new_threshold)
             return
+
+    if not buy_allowed:
+        logger.debug("%s skipped: within buy delay of session open", row.symbol)
+        return
 
     # Rule 4 (daily DCA buy): judged by success, not by attempt -- keeps
     # retrying (throttled to DAILY_BUY_RETRY_SECONDS) until an order actually
@@ -630,6 +697,11 @@ def main() -> None:
     active_rows: list[SheetRow] = []
     last_fx_refresh = 0.0
     startup_synced = False
+    # (row_number, column_name) -> latest value, accumulated across ticks and
+    # flushed to Sheets every SHEET_FLUSH_INTERVAL_SECONDS instead of every
+    # tick (see comment on SHEET_FLUSH_INTERVAL_SECONDS in config.py).
+    pending_sheet_updates: dict[tuple[int, str], str] = {}
+    last_sheet_flush = 0.0
 
     stop = {"flag": False}
 
@@ -643,7 +715,11 @@ def main() -> None:
     while not stop["flag"]:
         loop_start = time.monotonic()
         try:
-            now = dt.datetime.now(KST)
+            # Clock-skew-corrected time (see TossClient.now()) -- everything
+            # that decides "is the market open" / "how long has it been open"
+            # (is_market_open, _trading_day_key, the buy/sell open-delay in
+            # process_symbol) flows from this one value.
+            now = toss.now()
             today_str = now.date().isoformat()
 
             if sessions is None or (sessions.loaded_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST):
@@ -716,11 +792,22 @@ def main() -> None:
                             process_symbol(row, items.get(row.symbol), sessions, now, run_state, today_str, executor, exchange_rate_usd_krw, updates)
                         except Exception:
                             logger.exception("error processing %s; continuing with other symbols", row.symbol)
-                    if updates:
-                        try:
-                            sheets.batch_write(updates)
-                        except Exception:
-                            logger.exception("sheet batch_write failed")
+                    for row_number, column_name, value in updates:
+                        pending_sheet_updates[(row_number, column_name)] = value
+
+            # Flush accumulated cell updates on a slower cadence than the 1s
+            # strategy tick to stay well under the Sheets API's 60
+            # writes/minute/user quota. On failure, leave pending_sheet_updates
+            # in place (freshest value per cell wins next round) and still
+            # reset the flush clock so a persistent quota error can't cause a
+            # tight retry loop -- the next scheduled flush picks it up.
+            if pending_sheet_updates and time.monotonic() - last_sheet_flush >= SHEET_FLUSH_INTERVAL_SECONDS:
+                try:
+                    sheets.batch_write([(rn, col, val) for (rn, col), val in pending_sheet_updates.items()])
+                    pending_sheet_updates.clear()
+                except Exception:
+                    logger.exception("sheet batch_write failed")
+                last_sheet_flush = time.monotonic()
         except Exception:
             # Last-resort safety net: nothing above should reach here (each
             # step already has its own try/except), but a genuinely
@@ -729,6 +816,12 @@ def main() -> None:
 
         elapsed = time.monotonic() - loop_start
         time.sleep(max(0.0, TICK_SECONDS - elapsed))
+
+    if pending_sheet_updates:
+        try:
+            sheets.batch_write([(rn, col, val) for (rn, col), val in pending_sheet_updates.items()])
+        except Exception:
+            logger.exception("final sheet batch_write failed on shutdown")
 
     logger.info("stopped cleanly")
 

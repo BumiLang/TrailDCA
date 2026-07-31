@@ -25,8 +25,8 @@ def update_peak_and_threshold(
     """Rule (every-second tick):
     1. peak = max(peak, current_rate)
     2. if peak >= 10%:
-         threshold = peak * 0.75 - 3.5%   (peak < 30%)
-         threshold = peak * 0.7           (peak >= 30%)
+         threshold = peak * 0.8 - 3%   (peak < 30%)   -- threshold == 5% right at peak == 10%
+         threshold = peak * 0.7        (peak >= 30%)  -- meets the low branch exactly at 30%
        else: threshold unchanged
     """
     new_peak = max(peak, current_rate)

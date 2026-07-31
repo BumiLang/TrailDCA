@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as _dt
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,11 +74,30 @@ PEAK_ACTIVATION_RATE = _Decimal("0.10")
 # take-profit threshold once peak has activated:
 #   peak < TAKE_PROFIT_BREAKPOINT: threshold = peak * TAKE_PROFIT_LOW_SLOPE + TAKE_PROFIT_LOW_BASE
 #   peak >= TAKE_PROFIT_BREAKPOINT: threshold = peak * TAKE_PROFIT_HIGH_SLOPE
+# LOW_SLOPE/LOW_BASE are chosen so the low-branch line passes through
+# (peak=PEAK_ACTIVATION_RATE, threshold=0.05) -- i.e. threshold is exactly 5%
+# right when the threshold activates at 10% peak -- and through
+# (peak=TAKE_PROFIT_BREAKPOINT, threshold=TAKE_PROFIT_BREAKPOINT * TAKE_PROFIT_HIGH_SLOPE)
+# so it meets the high-branch line exactly at the breakpoint with no jump.
 TAKE_PROFIT_BREAKPOINT = _Decimal("0.30")
-TAKE_PROFIT_LOW_SLOPE = _Decimal("0.75")
-TAKE_PROFIT_LOW_BASE = _Decimal("-0.035")
+TAKE_PROFIT_LOW_SLOPE = _Decimal("0.8")
+TAKE_PROFIT_LOW_BASE = _Decimal("-0.03")
 TAKE_PROFIT_HIGH_SLOPE = _Decimal("0.7")
 INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%
 
+# Buy/sell orders (DCA buy, take-profit liquidation) only start once a
+# session has been open this long -- skips the volatile open, when peak/
+# threshold bookkeeping keeps running but no order is actually placed yet.
+# Configurable independently per market and per side.
+KR_BUY_DELAY_AFTER_OPEN = _dt.timedelta(hours=1)
+KR_SELL_DELAY_AFTER_OPEN = _dt.timedelta(minutes=5)
+US_BUY_DELAY_AFTER_OPEN = _dt.timedelta(0)
+US_SELL_DELAY_AFTER_OPEN = _dt.timedelta(0)
+
 TICK_SECONDS = 1
+# Sheets API allows only 60 write requests/minute/user; batch_write() is one
+# request regardless of how many cells it carries, so flushing on every 1s
+# tick sits right at that limit and trips "Quota exceeded" under any jitter.
+# Accumulate cell updates across ticks and flush at this cadence instead.
+SHEET_FLUSH_INTERVAL_SECONDS = 1
 DAILY_SNAPSHOT_HOUR_KST = 8
