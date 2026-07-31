@@ -47,13 +47,20 @@ class TestUpdatePeakAndThreshold:
 
 class TestShouldLiquidate:
     def test_no_liquidation_before_peak_activation(self):
-        assert strategy.should_liquidate(D("0.05"), D("-0.50"), D("-1.00")) is False
+        assert strategy.should_liquidate(D("0.05"), D("-0.50"), D("-1.00"), D("150000")) is False
 
     def test_liquidates_when_rate_drops_to_threshold(self):
-        assert strategy.should_liquidate(D("0.60"), D("0.20"), D("0.20")) is True
+        assert strategy.should_liquidate(D("0.60"), D("0.20"), D("0.20"), D("150000")) is True
 
     def test_no_liquidation_above_threshold(self):
-        assert strategy.should_liquidate(D("0.60"), D("0.25"), D("0.20")) is False
+        assert strategy.should_liquidate(D("0.60"), D("0.25"), D("0.20"), D("150000")) is False
+
+    def test_no_liquidation_while_purchase_amount_below_target(self):
+        # would otherwise liquidate, but purchase amount hasn't reached the 100k DCA target yet
+        assert strategy.should_liquidate(D("0.60"), D("0.20"), D("0.20"), D("99999")) is False
+
+    def test_liquidates_once_purchase_amount_reaches_target(self):
+        assert strategy.should_liquidate(D("0.60"), D("0.20"), D("0.20"), D("100000")) is True
 
 
 class TestDailyBuyAmount:
@@ -75,3 +82,36 @@ class TestDailyBuyAmount:
 class TestPeakAfterShareBuy:
     def test_peak_reassigned_after_buy(self):
         assert strategy.peak_after_share_buy(D("0.12")) == D("0.12")
+
+
+class TestNonfractionalIsDcaGraceWindow:
+    def test_true_below_target_and_below_ceiling(self):
+        assert strategy.nonfractional_is_dca_grace_window(D("50000"), D("55000")) is True
+
+    def test_false_once_projected_reaches_ceiling(self):
+        assert strategy.nonfractional_is_dca_grace_window(D("95000"), D("135000")) is False
+
+    def test_false_once_current_at_or_above_target(self):
+        assert strategy.nonfractional_is_dca_grace_window(D("100000"), D("110000")) is False
+
+
+class TestNonfractionalEntryAllowed:
+    def test_buys_regardless_of_rate_within_dca_grace_window(self):
+        # current 50,000 KRW (<100k), projected 55,000 KRW (<130k) -> allowed even at a loss
+        assert strategy.nonfractional_entry_allowed(D("50000"), D("55000"), D("-0.50"), D("-1.00")) is True
+
+    def test_below_target_at_or_above_ceiling_uses_flat_10pct_ignoring_threshold(self):
+        # current 95,000 KRW (<100k, so not yet at the "그 외" branch) but this buy pushes
+        # projected to 135,000 (>=130k ceiling) -> flat 10% floor, threshold (17%) ignored
+        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.05"), D("0.17")) is False
+        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.10"), D("0.17")) is True
+
+    def test_at_or_above_target_uses_threshold_regardless_of_projected_purchase(self):
+        # current purchase already >= 100k -> always the max(10%, threshold) gate,
+        # even though projected purchase (110k) hasn't reached the 130k ceiling
+        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.05"), D("-1.00")) is False
+        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.10"), D("-1.00")) is True
+
+    def test_at_or_above_target_rate_gate_uses_threshold_when_higher_than_10pct(self):
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.16"), D("0.17")) is False
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.17"), D("0.17")) is True

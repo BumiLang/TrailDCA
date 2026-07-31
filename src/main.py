@@ -491,29 +491,46 @@ def _attempt_fallback_share_buy(
 ) -> bool:
     """1-share fallback for symbols that don't support fractional-amount
     orders. Every DCA-buy day for such a symbol goes through this path (the
-    amount order fails every time), and each fill unconditionally resets
-    peak_rate to that day's rate (see peak_after_share_buy below) rather
-    than maxing it -- so unlike the amount-order path, this only fires while
-    the rate that would RESULT from adding this 1 share (not the current,
-    pre-buy rate) is already at/above both the 10% activation floor and the
-    currently active take-profit threshold. Buying 1 more share at the
-    current price pulls the average cost basis up toward that price, which
-    pulls the profit rate down -- gating on the projected post-buy rate
-    keeps that dip from landing at/below the trailing stop right as it's
-    reset. Assumes the symbol is already held by the time this strategy
-    manages it (first entry into a symbol is done manually, outside this
-    bot)."""
+    amount order fails every time). Entry eligibility is decided by
+    strategy.nonfractional_entry_allowed (DCA grace window / flat 10% floor
+    once past the ceiling / rate-vs-threshold gate once past the target --
+    see that function's docstring). Assumes the symbol is already held by
+    the time this strategy manages it (first entry into a symbol is done
+    manually, outside this bot).
+
+    Outside the DCA grace window, a fill unconditionally resets peak_rate to
+    the projected post-buy rate used for the entry decision (not maxed
+    against the prior peak) -- buying 1 more share at the current price
+    pulls the average cost basis up toward that price, which pulls the
+    profit rate down, so the peak has to reflect that dip rather than
+    staying anchored to a pre-buy high. Inside the grace window, peak_rate
+    is left alone: these buys aren't rate-gated at all, so force-resetting
+    peak to whatever (possibly poor) rate results each day would clobber
+    the trailing-stop tracking while the position is still being built out.
+    """
     price = executor.current_price(row.symbol)
+    current_purchase_amount = Decimal(item["marketValue"]["purchaseAmount"])
     projected_quantity = Decimal(item["quantity"]) + Decimal(1)
-    projected_purchase_amount = Decimal(item["marketValue"]["purchaseAmount"]) + price
+    projected_purchase_amount = current_purchase_amount + price
     projected_valuation = projected_quantity * price
     projected_rate = (projected_valuation - projected_purchase_amount) / projected_purchase_amount
 
-    entry_floor = max(PEAK_ACTIVATION_RATE, row.take_profit_threshold)
-    if projected_rate < entry_floor:
+    current_purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
+    projected_purchase_krw = (
+        projected_purchase_amount if item.get("currency") == "KRW"
+        else projected_purchase_amount * exchange_rate_usd_krw
+    )
+
+    is_grace_window = strategy.nonfractional_is_dca_grace_window(current_purchase_krw, projected_purchase_krw)
+
+    if not strategy.nonfractional_entry_allowed(
+        current_purchase_krw, projected_purchase_krw, projected_rate, row.take_profit_threshold
+    ):
+        entry_floor = max(PEAK_ACTIVATION_RATE, row.take_profit_threshold)
         logger.debug(
-            "%s: skipping 1-share fallback buy, post-buy rate %.4f below entry floor %.4f (max of 10%% activation and current take-profit threshold)",
-            row.symbol, projected_rate, entry_floor,
+            "%s: skipping 1-share fallback buy, post-buy rate %.4f below entry floor %.4f "
+            "(current_purchase=%s KRW, projected_purchase=%s KRW)",
+            row.symbol, projected_rate, entry_floor, current_purchase_krw, projected_purchase_krw,
         )
         return False
 
@@ -532,11 +549,14 @@ def _attempt_fallback_share_buy(
         logger.warning("fallback 1-share buy also failed for %s; will retry in %ds: %s", row.symbol, DAILY_BUY_RETRY_SECONDS, e)
         return False
 
-    new_rate = Decimal(result["profitLoss"]["rate"])
-    row.peak_rate = strategy.peak_after_share_buy(new_rate)
-    updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
+    if not is_grace_window:
+        row.peak_rate = strategy.peak_after_share_buy(projected_rate)
+        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
-    logger.info("BUY(1 share fallback) %s new_rate=%.4f", row.symbol, new_rate)
+    logger.info(
+        "BUY(1 share fallback) %s projected_rate=%.4f actual_rate=%s grace_window=%s",
+        row.symbol, projected_rate, result["profitLoss"]["rate"], is_grace_window,
+    )
     return True
 
 
@@ -601,12 +621,12 @@ def process_symbol(
         updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
         updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
         logger.debug(
-            "%s tick: rate=%.4f peak=%.4f threshold=%.4f liquidate=%s",
-            row.symbol, current_rate, new_peak, new_threshold,
-            strategy.should_liquidate(new_peak, current_rate, new_threshold),
+            "%s tick: rate=%.4f peak=%.4f threshold=%.4f purchase=%s KRW liquidate=%s",
+            row.symbol, current_rate, new_peak, new_threshold, row.purchase_amount_krw,
+            strategy.should_liquidate(new_peak, current_rate, new_threshold, row.purchase_amount_krw),
         )
 
-        if sell_allowed and strategy.should_liquidate(new_peak, current_rate, new_threshold):
+        if sell_allowed and strategy.should_liquidate(new_peak, current_rate, new_threshold, row.purchase_amount_krw):
             client_order_id = f"{today_str}-{row.symbol}-EXIT"[:36]
             try:
                 executor.liquidate(row.symbol, client_order_id=client_order_id)

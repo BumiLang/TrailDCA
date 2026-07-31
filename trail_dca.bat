@@ -7,4 +7,4 @@ PATH=C:\ProgramData\Anaconda3;C:\ProgramData\Anaconda3\Scripts;C:\ProgramData\An
 cd /d "%~dp0"
 setlocal enabledelayedexpansion
 
-call python ./src/main.py
+call python -m src.main
