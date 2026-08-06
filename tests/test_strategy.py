@@ -45,6 +45,44 @@ class TestUpdatePeakAndThreshold:
         assert peak == D("0.30")
 
 
+class TestUpdatePeakAndThresholdGated:
+    def test_below_target_tracks_peak_but_freezes_threshold(self):
+        # peak would normally activate a real threshold at 20%, but purchase
+        # amount hasn't reached the 100k DCA target yet -- threshold stays
+        # pinned at -100% even though peak keeps climbing in the background
+        peak, threshold = strategy.update_peak_and_threshold_gated(
+            D("0.10"), D("0.20"), D("-1.00"), D("50000"), just_reached_target=False
+        )
+        assert peak == D("0.20")
+        assert threshold == D("-1.00")
+
+    def test_crossing_target_resets_peak_to_current_rate(self):
+        # peak silently accumulated to 20% during the DCA phase; this tick
+        # is the one where purchase_amount_krw first reaches the target and
+        # current_rate has dropped back to 10% -- without a reset this would
+        # hand back an already-active 13% threshold above the current rate
+        peak, threshold = strategy.update_peak_and_threshold_gated(
+            D("0.20"), D("0.10"), D("-1.00"), D("100000"), just_reached_target=True
+        )
+        assert peak == D("0.10")
+        # peak=10% -> 0.10*0.8-0.03 = 0.05
+        assert threshold == D("0.05")
+
+    def test_crossing_target_below_activation_stays_inert(self):
+        peak, threshold = strategy.update_peak_and_threshold_gated(
+            D("0.05"), D("0.03"), D("-1.00"), D("100000"), just_reached_target=True
+        )
+        assert peak == D("0.03")
+        assert threshold == D("-1.00")
+
+    def test_above_target_tracks_normally(self):
+        peak, threshold = strategy.update_peak_and_threshold_gated(
+            D("0.10"), D("0.25"), D("0.05"), D("150000"), just_reached_target=False
+        )
+        assert peak == D("0.25")
+        assert threshold == D("0.17")
+
+
 class TestShouldLiquidate:
     def test_no_liquidation_before_peak_activation(self):
         assert strategy.should_liquidate(D("0.05"), D("-0.50"), D("-1.00"), D("150000")) is False

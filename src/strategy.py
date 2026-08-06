@@ -11,6 +11,7 @@ from src.config import (
     DAILY_BUY_KRW,
     DAILY_BUY_RESUME_RATE,
     DAILY_BUY_TARGET_KRW,
+    INITIAL_TAKE_PROFIT_THRESHOLD,
     NONFRACTIONAL_DCA_CEILING_KRW,
     PEAK_ACTIVATION_RATE,
     TAKE_PROFIT_BREAKPOINT,
@@ -39,6 +40,34 @@ def update_peak_and_threshold(
     else:
         new_threshold = current_threshold
     return new_peak, new_threshold
+
+
+def update_peak_and_threshold_gated(
+    peak: Decimal,
+    current_rate: Decimal,
+    current_threshold: Decimal,
+    purchase_amount_krw: Decimal,
+    just_reached_target: bool,
+) -> tuple[Decimal, Decimal]:
+    """update_peak_and_threshold, gated by DCA accumulation progress.
+
+    - Below DAILY_BUY_TARGET_KRW: peak keeps tracking in the background (so
+      it's accurate the moment the target is crossed), but threshold stays
+      pinned at its inert default -- should_liquidate is gated off below
+      the same target anyway, so an active threshold here is never
+      actionable and would only risk an immediate liquidation the instant
+      the target is reached.
+    - The tick the target is first crossed (just_reached_target=True):
+      start take-profit tracking fresh from the current rate, discarding
+      whatever peak silently accumulated during the DCA phase.
+    - At/above target on any later tick: normal peak/threshold tracking.
+    """
+    if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
+        new_peak, _ = update_peak_and_threshold(peak, current_rate, current_threshold)
+        return new_peak, INITIAL_TAKE_PROFIT_THRESHOLD
+    if just_reached_target:
+        return update_peak_and_threshold(current_rate, current_rate, INITIAL_TAKE_PROFIT_THRESHOLD)
+    return update_peak_and_threshold(peak, current_rate, current_threshold)
 
 
 def should_liquidate(peak: Decimal, current_rate: Decimal, threshold: Decimal, purchase_amount_krw: Decimal) -> bool:

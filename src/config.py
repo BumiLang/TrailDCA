@@ -96,9 +96,9 @@ INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%
 # threshold bookkeeping keeps running but no order is actually placed yet.
 # Configurable independently per market and per side.
 KR_BUY_DELAY_AFTER_OPEN = _dt.timedelta(hours=1)
-KR_SELL_DELAY_AFTER_OPEN = _dt.timedelta(minutes=5)
-US_BUY_DELAY_AFTER_OPEN = _dt.timedelta(0)
-US_SELL_DELAY_AFTER_OPEN = _dt.timedelta(0)
+KR_SELL_DELAY_AFTER_OPEN = _dt.timedelta(minutes=35)
+US_BUY_DELAY_AFTER_OPEN = _dt.timedelta(hours=1)
+US_SELL_DELAY_AFTER_OPEN = _dt.timedelta(minutes=35)
 
 TICK_SECONDS = 1
 # Sheets API allows only 60 write requests/minute/user; batch_write() is one

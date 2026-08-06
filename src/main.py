@@ -23,6 +23,7 @@ from pathlib import Path
 from src import strategy
 from src.config import (
     DAILY_BUY_RETRY_SECONDS,
+    DAILY_BUY_TARGET_KRW,
     DAILY_SNAPSHOT_HOUR_KST,
     INITIAL_TAKE_PROFIT_THRESHOLD,
     KR_BUY_DELAY_AFTER_OPEN,
@@ -572,7 +573,54 @@ def process_symbol(
     updates: list,
 ) -> None:
     if row.liquidated:
-        logger.debug("%s skipped: liquidated", row.symbol)
+        if item is None:
+            logger.debug("%s skipped: liquidated", row.symbol)
+            return
+        # Real holdings show a position again even though the sheet still
+        # marks this row liquidated -- e.g. manually re-bought via MTS
+        # after a take-profit exit or after being reconciled as externally
+        # sold. Revive the row: clear liquidated, mirror the live position,
+        # and reseed peak/threshold from the current rate, same gating as
+        # any other fresh position (update_peak_and_threshold_gated with
+        # just_reached_target=True) -- frozen at -100% if this re-entry is
+        # still below DAILY_BUY_TARGET_KRW, or activated immediately from
+        # the current rate if it already reached/passed it in one buy.
+        # Also mark today's DCA buy as already done for this symbol, so
+        # Rule 4 doesn't stack its own buy on top of the manual one on the
+        # same trading day. Return without running the rest of this tick's
+        # logic -- the revived row gets its normal mirror/peak/threshold/buy
+        # handling starting next tick, on a clean pass.
+        current_rate = Decimal(item["profitLoss"]["rate"])
+        purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
+        valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
+        profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
+        new_peak, new_threshold = strategy.update_peak_and_threshold_gated(
+            current_rate, current_rate, INITIAL_TAKE_PROFIT_THRESHOLD, purchase_krw, just_reached_target=True
+        )
+        row.liquidated = False
+        row.quantity = Decimal(item["quantity"])
+        row.purchase_amount_krw = purchase_krw
+        row.valuation_amount_krw = valuation_krw
+        row.profit_amount_krw = profit_krw
+        row.profit_rate = current_rate
+        row.peak_rate = new_peak
+        row.take_profit_threshold = new_threshold
+        updates.append((row.row_number, "청산여부", "FALSE"))
+        updates.append((row.row_number, "보유수량", str(row.quantity)))
+        updates.append((row.row_number, "매입금액_원화", str(purchase_krw.quantize(Decimal("1")))))
+        updates.append((row.row_number, "평가금액_원화", str(valuation_krw.quantize(Decimal("1")))))
+        updates.append((row.row_number, "평가손익_원화", str(profit_krw.quantize(Decimal("1")))))
+        updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
+        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
+        updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
+        updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
+        buy_day_key = _trading_day_key(row.market, sessions, now)
+        if not run_state.bought_today(buy_day_key, row.symbol):
+            run_state.mark_bought(buy_day_key, row.symbol)
+        logger.info(
+            "%s: liquidated row shows a live position again -- reviving (peak=%.4f threshold=%.4f from current rate %.4f, purchase=%s KRW), skipping today's DCA buy",
+            row.symbol, new_peak, new_threshold, current_rate, purchase_krw,
+        )
         return
     session_start = _current_session_start(sessions, row.market, now)
     if session_start is None:
@@ -597,6 +645,10 @@ def process_symbol(
         # Live mirror of the real position, refreshed every tick regardless
         # of 전략적용여부 -- the sheet should always reflect the actual
         # account even for symbols the strategy isn't actively managing.
+        # Captured before row.purchase_amount_krw is overwritten below, so
+        # the peak/threshold block further down can tell whether this tick
+        # is the one where the DCA target was just crossed.
+        just_reached_target = row.purchase_amount_krw < DAILY_BUY_TARGET_KRW
         purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
         valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
         profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
@@ -609,13 +661,40 @@ def process_symbol(
         updates.append((row.row_number, "평가금액_원화", str(valuation_krw.quantize(Decimal("1")))))
         updates.append((row.row_number, "평가손익_원화", str(profit_krw.quantize(Decimal("1")))))
         updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
+    elif row.quantity > 0:
+        # Real holdings no longer include this symbol, but the sheet still
+        # shows a live quantity and it was never marked liquidated by this
+        # bot (row.liquidated == False is guaranteed here, checked at the
+        # top of this function) -- the position was almost certainly closed
+        # out manually (e.g. via the MTS app) outside this process.
+        # Reconcile the sheet to reality and permanently retire the row so
+        # a stale purchase_amount_krw can't make Rule 4 try to re-buy a
+        # position the user just exited on purpose. (row.quantity == 0 here
+        # instead means the row was only ever manually pre-added and never
+        # actually bought yet -- leave those alone so a first manual buy
+        # can still be picked up normally.)
+        row.quantity = Decimal(0)
+        row.purchase_amount_krw = Decimal(0)
+        row.valuation_amount_krw = Decimal(0)
+        row.profit_amount_krw = Decimal(0)
+        row.liquidated = True
+        updates.append((row.row_number, "보유수량", "0"))
+        updates.append((row.row_number, "매입금액_원화", "0"))
+        updates.append((row.row_number, "평가금액_원화", "0"))
+        updates.append((row.row_number, "평가손익_원화", "0"))
+        updates.append((row.row_number, "청산여부", "TRUE"))
+        updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
+        logger.info("%s: no longer held but never marked liquidated -- reconciling as externally liquidated", row.symbol)
+        return
 
     if not row.strategy_enabled:
         logger.debug("%s skipped: strategy_enabled=False", row.symbol)
         return
 
     if held:
-        new_peak, new_threshold = strategy.update_peak_and_threshold(row.peak_rate, current_rate, row.take_profit_threshold)
+        new_peak, new_threshold = strategy.update_peak_and_threshold_gated(
+            row.peak_rate, current_rate, row.take_profit_threshold, row.purchase_amount_krw, just_reached_target
+        )
         row.peak_rate, row.take_profit_threshold, row.profit_rate = new_peak, new_threshold, current_rate
         updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
         updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
