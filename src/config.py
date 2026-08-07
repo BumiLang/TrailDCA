@@ -77,19 +77,30 @@ DAILY_BUY_RETRY_SECONDS = 60  # throttle interval between buy attempts until one
 # since a single whole-share buy can jump past it in one step.
 NONFRACTIONAL_DCA_CEILING_KRW = _Decimal("130000")
 PEAK_ACTIVATION_RATE = _Decimal("0.10")
-# take-profit threshold once peak has activated:
-#   peak < TAKE_PROFIT_BREAKPOINT: threshold = peak * TAKE_PROFIT_LOW_SLOPE + TAKE_PROFIT_LOW_BASE
-#   peak >= TAKE_PROFIT_BREAKPOINT: threshold = peak * TAKE_PROFIT_HIGH_SLOPE
-# LOW_SLOPE/LOW_BASE are chosen so the low-branch line passes through
-# (peak=PEAK_ACTIVATION_RATE, threshold=0.05) -- i.e. threshold is exactly 5%
-# right when the threshold activates at 10% peak -- and through
-# (peak=TAKE_PROFIT_BREAKPOINT, threshold=TAKE_PROFIT_BREAKPOINT * TAKE_PROFIT_HIGH_SLOPE)
-# so it meets the high-branch line exactly at the breakpoint with no jump.
-TAKE_PROFIT_BREAKPOINT = _Decimal("0.30")
-TAKE_PROFIT_LOW_SLOPE = _Decimal("0.8")
-TAKE_PROFIT_LOW_BASE = _Decimal("-0.03")
-TAKE_PROFIT_HIGH_SLOPE = _Decimal("0.7")
-INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%
+INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%, inert value before peak activates
+
+# Staged trailing-stop liquidation, keyed off the *relative* drawdown from
+# peak profit rate (peak - current_rate) / peak. 익절기준 is now derived
+# directly from this same peak/stage state (see
+# strategy.next_liquidation_trigger_rate) -- it shows the rate at which the
+# next not-yet-fired stage would sell, and doubles as the non-fractional
+# fallback-buy entry floor. A fresh (higher) peak restarts this staged
+# cycle from scratch, so a partial sell doesn't block another one after a
+# new high and pullback. Below PEAK_ACTIVATION_RATE nothing can fire.
+LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.20")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_2_DRAWDOWN = _Decimal("0.40")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_3_DRAWDOWN = _Decimal("0.50")  # sell everything remaining, liquidated=True
+LIQUIDATION_STAGE_SELL_FRACTION = _Decimal("0.50")
+# How high peak has to have gotten before each of the earlier (less severe)
+# stages is even eligible to fire -- a position whose peak never really
+# took off doesn't get the same gradual staging as one that ran up a lot.
+# Stage 3 (the 50% full-exit stop-loss) has no extra minimum beyond
+# PEAK_ACTIVATION_RATE -- it's always the last-resort stop once activated.
+#   peak <  LIQUIDATION_STAGE_2_MIN_PEAK (20%): only stage 3 can fire.
+#   LIQUIDATION_STAGE_2_MIN_PEAK <= peak < LIQUIDATION_STAGE_1_MIN_PEAK (30%): stages 2-3.
+#   peak >= LIQUIDATION_STAGE_1_MIN_PEAK (30%): stages 1-3 (all of them).
+LIQUIDATION_STAGE_1_MIN_PEAK = _Decimal("0.30")
+LIQUIDATION_STAGE_2_MIN_PEAK = _Decimal("0.20")
 
 # Buy/sell orders (DCA buy, take-profit liquidation) only start once a
 # session has been open this long -- skips the volatile open, when peak/
@@ -107,3 +118,8 @@ TICK_SECONDS = 1
 # Accumulate cell updates across ticks and flush at this cadence instead.
 SHEET_FLUSH_INTERVAL_SECONDS = 1
 DAILY_SNAPSHOT_HOUR_KST = 8
+# 전략적용여부 is otherwise only refreshed from the sheet once/day (as part of
+# the full daily_snapshot row reload) -- too slow to react to a manual
+# toggle. Re-read just this column at this cadence instead, independent of
+# the full row reload, so a manual edit takes effect within a minute.
+STRATEGY_ENABLED_REFRESH_INTERVAL_SECONDS = 60

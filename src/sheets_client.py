@@ -144,14 +144,15 @@ class SheetsClient:
         profit_rate_pct: str = "0",
         peak_rate_pct: str = "0",
         take_profit_threshold_pct: str = "-100",
+        sell_stage: str = "0",
     ) -> list[str]:
         """New symbol discovered in broker holdings but absent from the sheet.
-        전략적용여부=TRUE, 청산여부=FALSE are hard defaults; 보유수량/매입금액/
-        평가금액/평가손익/수익률/최고수익률/익절기준 reflect the real holdings
-        just fetched in the same sync (최고수익률 seeded to the current profit
-        rate, and 익절기준 derived from that peak via the normal
-        trailing-stop formula, since this symbol has no tracked peak history
-        yet)."""
+        전략적용여부=TRUE, 청산여부=FALSE, 매도단계=0 are hard defaults; 보유수량/
+        매입금액/평가금액/평가손익/수익률/최고수익률/익절기준 reflect the real
+        holdings just fetched in the same sync (최고수익률 seeded to the
+        current profit rate, and 익절기준 derived from that peak via the
+        normal trailing-stop formula, since this symbol has no tracked peak
+        history yet)."""
         now = dt.datetime.now(KST).isoformat(timespec="seconds")
         row = {
             "종목코드": symbol,
@@ -165,6 +166,7 @@ class SheetsClient:
             "전략적용여부": "TRUE",
             "최고수익률": peak_rate_pct,
             "익절기준": take_profit_threshold_pct,
+            "매도단계": sell_stage,
             "청산여부": "FALSE",
             "마지막갱신": now,
         }
@@ -213,6 +215,28 @@ class SheetsClient:
             a1 = gspread.utils.rowcol_to_a1(row_number, self._col(column_name))
             data.append({"range": a1, "values": [[_user_entered_value(column_name, value)]]})
         self._ws.batch_update(data, value_input_option="USER_ENTERED")
+
+    def delete_rows(self, row_numbers: list[int]) -> None:
+        """Delete the given 1-indexed data rows (never the header) in a
+        single batchUpdate call. Requests are ordered by descending row
+        index so each deletion doesn't shift the position of a row still
+        queued for deletion later in the same call."""
+        if not row_numbers:
+            return
+        requests = [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": self._ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": rn - 1,
+                        "endIndex": rn,
+                    }
+                }
+            }
+            for rn in sorted(set(row_numbers), reverse=True)
+        ]
+        self._ws.spreadsheet.batch_update({"requests": requests})
 
     def touch_last_updated(self, row_number: int) -> tuple[int, str, str]:
         now = dt.datetime.now(KST).isoformat(timespec="seconds")

@@ -16,7 +16,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -29,10 +29,12 @@ from src.config import (
     KR_BUY_DELAY_AFTER_OPEN,
     KR_SELL_DELAY_AFTER_OPEN,
     KST,
+    LIQUIDATION_STAGE_SELL_FRACTION,
     PEAK_ACTIVATION_RATE,
     PROJECT_ROOT,
     SHEET_FLUSH_INTERVAL_SECONDS,
     STATE_FILE,
+    STRATEGY_ENABLED_REFRESH_INTERVAL_SECONDS,
     TICK_SECONDS,
     US_BUY_DELAY_AFTER_OPEN,
     US_SELL_DELAY_AFTER_OPEN,
@@ -321,6 +323,75 @@ class OrderExecutor:
             sim = self._sim.pop(symbol, None)
             logger.info("[DRY-RUN] SELL(all) %s qty=%s", symbol, sim["quantity"] if sim else "0")
 
+    def liquidate_partial(
+        self, symbol: str, market: Market, currency: str, fraction: Decimal, client_order_id: str = ""
+    ) -> dict | None:
+        """Sell `fraction` of the current sellable quantity as a market
+        order (e.g. fraction=0.5 sells half the position). KR quantities
+        are floored to a whole share since KR doesn't support fractional
+        order quantities (see _attempt_fallback_share_buy). Returns the
+        post-trade holdings item (same shape as buy()/the dry-run
+        simulation), or None if the computed quantity rounds down to zero
+        -- too small a whole-share KR position to split at this fraction;
+        the caller should leave sell_stage untouched and let a deeper
+        stage fire instead."""
+        if self._live:
+            sellable = Decimal(self._toss.get_sellable_quantity(self._account_seq, symbol)["sellableQuantity"])
+            qty = _partial_sell_quantity(sellable, fraction, market)
+            if qty <= 0:
+                return None
+            order = self._toss.place_order(
+                self._account_seq,
+                symbol,
+                "SELL",
+                "MARKET",
+                quantity=qty,
+                client_order_id=client_order_id,
+            )
+            final = self._toss.wait_for_terminal_status(self._account_seq, order["orderId"])
+            if final.get("status") != "FILLED":
+                raise OrderNotFilledError(final)
+            holdings = self._toss.get_holdings(self._account_seq, symbol=symbol)
+            items = holdings.get("items", [])
+            if not items:
+                raise RuntimeError(f"partial sell for {symbol} filled but holdings lookup returned nothing")
+            return items[0]
+
+        sim = self._sim.get(symbol)
+        if sim is None:
+            return None
+        qty = _partial_sell_quantity(sim["quantity"], fraction, market)
+        if qty <= 0:
+            return None
+        price = self.current_price(symbol)
+        cost_removed = sim["purchase_amount"] * (qty / sim["quantity"])
+        sim["quantity"] -= qty
+        sim["purchase_amount"] -= cost_removed
+        valuation = sim["quantity"] * price
+        profit_amount = valuation - sim["purchase_amount"]
+        rate = profit_amount / sim["purchase_amount"]
+        logger.info(
+            "[DRY-RUN] SELL(partial x%s) %s qty=%s -> sim_qty=%s sim_rate=%.4f",
+            fraction, symbol, qty, sim["quantity"], rate,
+        )
+        return {
+            "symbol": symbol,
+            "quantity": str(sim["quantity"]),
+            "currency": currency,
+            "marketValue": {"purchaseAmount": str(sim["purchase_amount"]), "amount": str(valuation)},
+            "profitLoss": {"rate": str(rate), "amount": str(profit_amount)},
+        }
+
+
+def _partial_sell_quantity(quantity: Decimal, fraction: Decimal, market: Market) -> Decimal:
+    """KR doesn't support fractional order quantities (see the fallback
+    whole-share buy path in _attempt_fallback_share_buy) -- floor a partial
+    sell to a whole share there; other markets keep full precision."""
+    raw = quantity * fraction
+    if market == Market.KR:
+        return raw.to_integral_value(rounding=ROUND_DOWN)
+    return raw
+
 
 # ---------------------------------------------------------------------------
 # Holdings sync (on service startup, and once/day thereafter): pull real
@@ -381,11 +452,12 @@ def daily_snapshot(
             updates.append((row.row_number, "마지막갱신", now_iso))
         else:
             # 최고수익률 seeds to the current rate (no tracked history yet);
-            # 익절기준 is derived from that same peak via the normal
-            # trailing-stop formula, not hardcoded, so a newly-synced holding
-            # that's already well above the 10% activation bar gets a real
-            # take-profit floor instead of the inert -100% default.
-            _, threshold = strategy.update_peak_and_threshold(rate, rate, INITIAL_TAKE_PROFIT_THRESHOLD)
+            # 익절기준 is the next staged-sell trigger rate for that peak
+            # (see strategy.next_liquidation_trigger_rate), not hardcoded,
+            # so a newly-synced holding that's already well above the 10%
+            # activation bar gets a real value instead of the inert -100%
+            # default.
+            threshold = strategy.next_liquidation_trigger_rate(rate, 0) if rate >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
             new_rows.append(dict(
                 symbol=symbol,
                 name=item.get("name", ""),
@@ -403,6 +475,17 @@ def daily_snapshot(
     sheets.batch_write(updates)
     sheets.append_default_rows(new_rows)
     logger.info("daily snapshot reconciled %d holdings", len(items))
+
+
+def _delete_liquidated_rows(sheets: SheetsClient) -> None:
+    """Weekly cleanup: on the Monday run of the daily snapshot, drop
+    청산여부=TRUE rows from the sheet entirely so it doesn't grow unbounded
+    with old, fully-exited positions."""
+    rows = sheets.read_rows()
+    liquidated_row_numbers = [r.row_number for r in rows if r.liquidated]
+    if liquidated_row_numbers:
+        sheets.delete_rows(liquidated_row_numbers)
+        logger.info("weekly cleanup: deleted %d liquidated row(s) from sheet", len(liquidated_row_numbers))
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +654,7 @@ def process_symbol(
     executor: OrderExecutor,
     exchange_rate_usd_krw: Decimal,
     updates: list,
+    was_strategy_enabled: bool,
 ) -> None:
     if row.liquidated:
         if item is None:
@@ -580,8 +664,9 @@ def process_symbol(
         # marks this row liquidated -- e.g. manually re-bought via MTS
         # after a take-profit exit or after being reconciled as externally
         # sold. Revive the row: clear liquidated, mirror the live position,
-        # and reseed peak/threshold from the current rate, same gating as
-        # any other fresh position (update_peak_and_threshold_gated with
+        # and reseed peak/threshold/sell_stage from the current rate, same
+        # gating as any other fresh position
+        # (update_peak_threshold_and_sell_stage_gated with
         # just_reached_target=True) -- frozen at -100% if this re-entry is
         # still below DAILY_BUY_TARGET_KRW, or activated immediately from
         # the current rate if it already reached/passed it in one buy.
@@ -594,8 +679,8 @@ def process_symbol(
         purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
         valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
         profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
-        new_peak, new_threshold = strategy.update_peak_and_threshold_gated(
-            current_rate, current_rate, INITIAL_TAKE_PROFIT_THRESHOLD, purchase_krw, just_reached_target=True
+        new_peak, new_threshold, new_stage, _, _ = strategy.update_peak_threshold_and_sell_stage_gated(
+            current_rate, current_rate, 0, purchase_krw, just_reached_target=True
         )
         row.liquidated = False
         row.quantity = Decimal(item["quantity"])
@@ -605,6 +690,7 @@ def process_symbol(
         row.profit_rate = current_rate
         row.peak_rate = new_peak
         row.take_profit_threshold = new_threshold
+        row.sell_stage = new_stage
         updates.append((row.row_number, "청산여부", "FALSE"))
         updates.append((row.row_number, "보유수량", str(row.quantity)))
         updates.append((row.row_number, "매입금액_원화", str(purchase_krw.quantize(Decimal("1")))))
@@ -613,6 +699,7 @@ def process_symbol(
         updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
         updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
         updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
+        updates.append((row.row_number, "매도단계", str(new_stage)))
         updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
         buy_day_key = _trading_day_key(row.market, sessions, now)
         if not run_state.bought_today(buy_day_key, row.symbol):
@@ -678,56 +765,104 @@ def process_symbol(
         row.valuation_amount_krw = Decimal(0)
         row.profit_amount_krw = Decimal(0)
         row.liquidated = True
+        row.sell_stage = 0
         updates.append((row.row_number, "보유수량", "0"))
         updates.append((row.row_number, "매입금액_원화", "0"))
         updates.append((row.row_number, "평가금액_원화", "0"))
         updates.append((row.row_number, "평가손익_원화", "0"))
+        updates.append((row.row_number, "매도단계", "0"))
         updates.append((row.row_number, "청산여부", "TRUE"))
         updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
         logger.info("%s: no longer held but never marked liquidated -- reconciling as externally liquidated", row.symbol)
         return
 
+    if held:
+        # 수익률/최고수익률 keep tracking regardless of 전략적용여부 -- same
+        # spirit as the live mirror block above, so the sheet always shows
+        # an accurate peak even for symbols the strategy isn't actively
+        # managing. But the moment 전략적용여부 flips FALSE -> TRUE, treat it
+        # like any other fresh-start event (same as just_reached_target):
+        # discard whatever peak/threshold/stage accumulated while disabled
+        # and restart from the current rate, so a peak that quietly climbed
+        # while unmanaged can't hand back an already-active threshold (or a
+        # stale sell_stage) the instant management resumes.
+        just_enabled = row.strategy_enabled and not was_strategy_enabled
+        new_peak, new_threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            row.peak_rate, current_rate, row.sell_stage, row.purchase_amount_krw, just_reached_target or just_enabled,
+        )
+        row.peak_rate, row.profit_rate = new_peak, current_rate
+        updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
+        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
+
+        if not row.strategy_enabled:
+            logger.debug("%s: strategy_enabled=False, only 수익률/최고수익률 updated", row.symbol)
+        else:
+            # 익절기준/매도단계 and the sell decision itself only apply while
+            # the strategy is actively managing this row. stage is committed
+            # unconditionally here -- it's pure peak-driven bookkeeping (a
+            # fresh high restarts the staged cycle), independent of whether
+            # the order below actually fires this tick.
+            row.take_profit_threshold, row.sell_stage = new_threshold, stage
+            updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
+            updates.append((row.row_number, "매도단계", str(stage)))
+            logger.debug(
+                "%s tick: rate=%.4f peak=%.4f threshold=%.4f purchase=%s KRW stage=%d action=%s",
+                row.symbol, current_rate, new_peak, new_threshold, row.purchase_amount_krw, stage, action,
+            )
+
+            if sell_allowed and action == "FULL":
+                client_order_id = f"{today_str}-{row.symbol}-EXIT"[:36]
+                try:
+                    executor.liquidate(row.symbol, client_order_id=client_order_id)
+                except (TossApiError, OrderNotFilledError) as e:
+                    # Do NOT mark liquidated on a failed/rejected sell -- the
+                    # position is still real. Leave state untouched
+                    # (sell_stage stays at `stage`, not `next_stage`) so the
+                    # next tick's check retries the sell.
+                    logger.warning("liquidation failed for %s, will retry next tick: %s", row.symbol, e)
+                    return
+                row.quantity = Decimal(0)
+                row.purchase_amount_krw = Decimal(0)
+                row.valuation_amount_krw = Decimal(0)
+                row.profit_amount_krw = Decimal(0)
+                row.liquidated = True
+                row.sell_stage = next_stage
+                updates.append((row.row_number, "보유수량", "0"))
+                updates.append((row.row_number, "매입금액_원화", "0"))
+                updates.append((row.row_number, "평가금액_원화", "0"))
+                updates.append((row.row_number, "평가손익_원화", "0"))
+                updates.append((row.row_number, "매도단계", str(next_stage)))
+                updates.append((row.row_number, "청산여부", "TRUE"))
+                updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
+                logger.info("LIQUIDATED(FULL) %s peak=%.4f rate=%.4f", row.symbol, new_peak, current_rate)
+                return
+
+            if sell_allowed and action == "PARTIAL":
+                currency = "KRW" if row.market == Market.KR else "USD"
+                client_order_id = f"{today_str}-{row.symbol}-STAGE{next_stage}"[:36]
+                try:
+                    result = executor.liquidate_partial(
+                        row.symbol, row.market, currency, LIQUIDATION_STAGE_SELL_FRACTION, client_order_id=client_order_id
+                    )
+                except (TossApiError, OrderNotFilledError) as e:
+                    # Same retry-next-tick contract as the FULL branch above.
+                    logger.warning("partial liquidation failed for %s, will retry next tick: %s", row.symbol, e)
+                    return
+                if result is None:
+                    # Computed sell quantity rounded down to zero (a
+                    # whole-share KR position too small to split at this
+                    # fraction) -- leave sell_stage as-is so a deeper stage
+                    # can still fire once the drawdown gets there.
+                    logger.debug("%s: partial sell at stage %d skipped, computed quantity rounded to 0", row.symbol, next_stage)
+                else:
+                    _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+                    row.sell_stage = next_stage
+                    updates.append((row.row_number, "매도단계", str(next_stage)))
+                    logger.info("PARTIAL SELL (stage %d) %s peak=%.4f rate=%.4f", next_stage, row.symbol, new_peak, current_rate)
+
     if not row.strategy_enabled:
         logger.debug("%s skipped: strategy_enabled=False", row.symbol)
         return
-
-    if held:
-        new_peak, new_threshold = strategy.update_peak_and_threshold_gated(
-            row.peak_rate, current_rate, row.take_profit_threshold, row.purchase_amount_krw, just_reached_target
-        )
-        row.peak_rate, row.take_profit_threshold, row.profit_rate = new_peak, new_threshold, current_rate
-        updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
-        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
-        updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
-        logger.debug(
-            "%s tick: rate=%.4f peak=%.4f threshold=%.4f purchase=%s KRW liquidate=%s",
-            row.symbol, current_rate, new_peak, new_threshold, row.purchase_amount_krw,
-            strategy.should_liquidate(new_peak, current_rate, new_threshold, row.purchase_amount_krw),
-        )
-
-        if sell_allowed and strategy.should_liquidate(new_peak, current_rate, new_threshold, row.purchase_amount_krw):
-            client_order_id = f"{today_str}-{row.symbol}-EXIT"[:36]
-            try:
-                executor.liquidate(row.symbol, client_order_id=client_order_id)
-            except (TossApiError, OrderNotFilledError) as e:
-                # Do NOT mark liquidated on a failed/rejected sell -- the
-                # position is still real. Leave state untouched so the next
-                # tick's should_liquidate check retries the sell.
-                logger.warning("liquidation failed for %s, will retry next tick: %s", row.symbol, e)
-                return
-            row.quantity = Decimal(0)
-            row.purchase_amount_krw = Decimal(0)
-            row.valuation_amount_krw = Decimal(0)
-            row.profit_amount_krw = Decimal(0)
-            row.liquidated = True
-            updates.append((row.row_number, "보유수량", "0"))
-            updates.append((row.row_number, "매입금액_원화", "0"))
-            updates.append((row.row_number, "평가금액_원화", "0"))
-            updates.append((row.row_number, "평가손익_원화", "0"))
-            updates.append((row.row_number, "청산여부", "TRUE"))
-            updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
-            logger.info("LIQUIDATED %s peak=%.4f rate=%.4f threshold=%.4f", row.symbol, new_peak, current_rate, new_threshold)
-            return
 
     if not buy_allowed:
         logger.debug("%s skipped: within buy delay of session open", row.symbol)
@@ -795,12 +930,21 @@ def main() -> None:
     exchange_rate_usd_krw = Decimal("1300")  # seed; refreshed before first real use below
     active_rows: list[SheetRow] = []
     last_fx_refresh = 0.0
+    last_strategy_enabled_refresh = 0.0
     startup_synced = False
     # (row_number, column_name) -> latest value, accumulated across ticks and
     # flushed to Sheets every SHEET_FLUSH_INTERVAL_SECONDS instead of every
     # tick (see comment on SHEET_FLUSH_INTERVAL_SECONDS in config.py).
     pending_sheet_updates: dict[tuple[int, str], str] = {}
     last_sheet_flush = 0.0
+    # Per-symbol 전략적용여부 as of the last tick it was observed -- lets
+    # process_symbol detect the exact tick a row flips FALSE -> TRUE. Even
+    # though 전략적용여부 itself is now refreshed every
+    # STRATEGY_ENABLED_REFRESH_INTERVAL_SECONDS (see below), this still can't
+    # be inferred from the SheetRow object alone: row.strategy_enabled is
+    # mutated in place between ticks, so without this separate "last seen"
+    # snapshot there'd be nothing to diff against.
+    strategy_enabled_seen: dict[str, bool] = {}
 
     stop = {"flag": False}
 
@@ -845,18 +989,39 @@ def main() -> None:
             if not startup_synced or (run_state.last_snapshot_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST):
                 try:
                     daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw)
+                    if now.weekday() == 0:  # Monday
+                        _delete_liquidated_rows(sheets)
                     run_state.last_snapshot_date = today_str
                     run_state.save()
                     active_rows = sheets.read_rows()
                     startup_synced = True
+                    last_strategy_enabled_refresh = time.monotonic()
                 except Exception:
                     logger.exception("daily snapshot failed, will retry next tick")
 
             if not active_rows:
                 try:
                     active_rows = sheets.read_rows()
+                    last_strategy_enabled_refresh = time.monotonic()
                 except Exception:
                     logger.exception("failed to read sheet rows; will retry next tick")
+
+            # 전략적용여부 alone is re-read on this faster cadence (independent
+            # of the once/day full row reload above) so a manual sheet toggle
+            # takes effect within a minute. Only this one field is merged in
+            # -- everything else (quantity/peak/threshold/stage/...) stays
+            # whatever this process has been tracking live in memory, since
+            # that's the source of truth intra-day and re-reading it here
+            # could race with a not-yet-flushed pending_sheet_updates write.
+            if active_rows and time.monotonic() - last_strategy_enabled_refresh >= STRATEGY_ENABLED_REFRESH_INTERVAL_SECONDS:
+                try:
+                    fresh_enabled = {r.symbol: r.strategy_enabled for r in sheets.read_rows()}
+                    for row in active_rows:
+                        if row.symbol in fresh_enabled:
+                            row.strategy_enabled = fresh_enabled[row.symbol]
+                except Exception:
+                    logger.exception("periodic 전략적용여부 refresh failed, keeping previous values")
+                last_strategy_enabled_refresh = time.monotonic()
 
             if time.monotonic() - last_fx_refresh > 60:
                 try:
@@ -887,10 +1052,15 @@ def main() -> None:
                 if holdings_ok:
                     updates: list[tuple[int, str, str]] = []
                     for row in candidates:
+                        was_strategy_enabled = strategy_enabled_seen.get(row.symbol, row.strategy_enabled)
                         try:
-                            process_symbol(row, items.get(row.symbol), sessions, now, run_state, today_str, executor, exchange_rate_usd_krw, updates)
+                            process_symbol(
+                                row, items.get(row.symbol), sessions, now, run_state, today_str,
+                                executor, exchange_rate_usd_krw, updates, was_strategy_enabled,
+                            )
                         except Exception:
                             logger.exception("error processing %s; continuing with other symbols", row.symbol)
+                        strategy_enabled_seen[row.symbol] = row.strategy_enabled
                     for row_number, column_name, value in updates:
                         pending_sheet_updates[(row_number, column_name)] = value
 

@@ -35,6 +35,7 @@ SHEET_COLUMNS = [
     "최고수익률",
     "전략적용여부",
     "익절기준",
+    "매도단계",
     "청산여부",
     "마지막갱신",
 ]
@@ -54,6 +55,7 @@ class SheetRow:
     strategy_enabled: bool
     peak_rate: Decimal  # fraction
     take_profit_threshold: Decimal  # fraction
+    sell_stage: int  # 0 = none, 1 = 20%-drawdown partial sold, 2 = 40%-drawdown partial sold
     liquidated: bool
     last_updated: str
 
@@ -91,6 +93,7 @@ class SheetRow:
             strategy_enabled=cls._bool(record.get("전략적용여부", "FALSE")),
             peak_rate=cls._dec(record.get("최고수익률", "0")) / Decimal(100),
             take_profit_threshold=cls._dec(record.get("익절기준", "-100")) / Decimal(100),
+            sell_stage=int(cls._dec(record.get("매도단계", "0"))),
             liquidated=cls._bool(record.get("청산여부", "FALSE")),
             last_updated=str(record.get("마지막갱신", "")).strip(),
         )

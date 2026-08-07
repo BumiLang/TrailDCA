@@ -12,75 +12,120 @@ from src.config import (
     DAILY_BUY_RESUME_RATE,
     DAILY_BUY_TARGET_KRW,
     INITIAL_TAKE_PROFIT_THRESHOLD,
+    LIQUIDATION_STAGE_1_DRAWDOWN,
+    LIQUIDATION_STAGE_1_MIN_PEAK,
+    LIQUIDATION_STAGE_2_DRAWDOWN,
+    LIQUIDATION_STAGE_2_MIN_PEAK,
+    LIQUIDATION_STAGE_3_DRAWDOWN,
     NONFRACTIONAL_DCA_CEILING_KRW,
     PEAK_ACTIVATION_RATE,
-    TAKE_PROFIT_BREAKPOINT,
-    TAKE_PROFIT_HIGH_SLOPE,
-    TAKE_PROFIT_LOW_BASE,
-    TAKE_PROFIT_LOW_SLOPE,
 )
 
 
-def update_peak_and_threshold(
-    peak: Decimal, current_rate: Decimal, current_threshold: Decimal
-) -> tuple[Decimal, Decimal]:
-    """Rule (every-second tick):
-    1. peak = max(peak, current_rate)
-    2. if peak >= 10%:
-         threshold = peak * 0.8 - 3%   (peak < 30%)   -- threshold == 5% right at peak == 10%
-         threshold = peak * 0.7        (peak >= 30%)  -- meets the low branch exactly at 30%
-       else: threshold unchanged
+def next_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
+    """The profit-rate level at which the NEXT not-yet-fired, currently
+    ELIGIBLE staged sell would trigger (see
+    update_peak_threshold_and_sell_stage_gated) -- e.g. sell_stage=0 with
+    peak >= LIQUIDATION_STAGE_1_MIN_PEAK means the 20%-drawdown partial
+    sell hasn't fired yet and is eligible, so the next trigger is
+    peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN). If peak hasn't reached the
+    minimum for a given stage, that stage is skipped even if sell_stage
+    hasn't reached it yet -- a position whose peak never really took off
+    only ever gets the deepest (50%-drawdown) stop-loss. This is this
+    row's 익절기준: both the non-fractional fallback-buy entry gate
+    (nonfractional_entry_allowed) and the sheet's informational value use
+    it, now that liquidation itself is fully staged rather than driven by
+    a separate formula.
     """
-    new_peak = max(peak, current_rate)
-    if new_peak >= PEAK_ACTIVATION_RATE:
-        if new_peak < TAKE_PROFIT_BREAKPOINT:
-            new_threshold = new_peak * TAKE_PROFIT_LOW_SLOPE + TAKE_PROFIT_LOW_BASE
-        else:
-            new_threshold = new_peak * TAKE_PROFIT_HIGH_SLOPE
-    else:
-        new_threshold = current_threshold
-    return new_peak, new_threshold
+    if sell_stage < 1 and peak >= LIQUIDATION_STAGE_1_MIN_PEAK:
+        return peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN)
+    if sell_stage < 2 and peak >= LIQUIDATION_STAGE_2_MIN_PEAK:
+        return peak * (1 - LIQUIDATION_STAGE_2_DRAWDOWN)
+    return peak * (1 - LIQUIDATION_STAGE_3_DRAWDOWN)
 
 
-def update_peak_and_threshold_gated(
+def update_peak_threshold_and_sell_stage_gated(
     peak: Decimal,
     current_rate: Decimal,
-    current_threshold: Decimal,
+    sell_stage: int,
     purchase_amount_krw: Decimal,
     just_reached_target: bool,
-) -> tuple[Decimal, Decimal]:
-    """update_peak_and_threshold, gated by DCA accumulation progress.
+) -> tuple[Decimal, Decimal, int, int, str | None]:
+    """Staged trailing-stop liquidation. 익절기준(threshold) is derived
+    directly from the same peak/stage state via next_liquidation_trigger_rate
+    -- it shows the rate at which the next not-yet-fired stage would sell.
 
-    - Below DAILY_BUY_TARGET_KRW: peak keeps tracking in the background (so
-      it's accurate the moment the target is crossed), but threshold stays
-      pinned at its inert default -- should_liquidate is gated off below
-      the same target anyway, so an active threshold here is never
-      actionable and would only risk an immediate liquidation the instant
-      the target is reached.
+    - Below DAILY_BUY_TARGET_KRW: peak tracks in the background (so it's
+      accurate the moment the target is crossed), threshold pinned at its
+      inert -100% default, sell_stage frozen at 0, no sell action possible
+      -- liquidation only becomes possible once the position is fully
+      built out.
     - The tick the target is first crossed (just_reached_target=True):
-      start take-profit tracking fresh from the current rate, discarding
-      whatever peak silently accumulated during the DCA phase.
-    - At/above target on any later tick: normal peak/threshold tracking.
+      peak/threshold/stage all restart fresh from the current rate,
+      discarding whatever peak silently accumulated during the DCA phase.
+      Callers also pass True here for any other "start fresh now" event
+      that should reset the same way -- e.g. main.py ORs in the tick
+      전략적용여부 just flipped FALSE -> TRUE, discarding whatever peak
+      quietly accumulated while unmanaged.
+    - At/above target on later ticks: normal peak tracking (never
+      decreases). A fresh (higher) peak restarts the staged cycle from
+      scratch (stage reset to 0) -- a partial sell at one high doesn't
+      block another after the position makes a new, higher high and pulls
+      back again. At most ONE stage fires per tick -- checked from the
+      smallest drawdown up, so a gap straight past an earlier stage (e.g.
+      a crash straight to 45% drawdown while stage 0 hasn't fired yet)
+      fires the earliest un-fired ELIGIBLE stage first, not the deepest
+      one; a later, still-un-fired stage whose bar is still cleared then
+      fires on a subsequent tick, working through 20% -> 40% -> 50% in
+      order rather than jumping ahead:
+        - stage < 1 and peak >= LIQUIDATION_STAGE_1_MIN_PEAK (30%) and
+          drawdown >= 20% (LIQUIDATION_STAGE_1_DRAWDOWN): PARTIAL (sell
+          LIQUIDATION_STAGE_SELL_FRACTION of current holding).
+        - stage < 2 and peak >= LIQUIDATION_STAGE_2_MIN_PEAK (20%) and
+          drawdown >= 40% (LIQUIDATION_STAGE_2_DRAWDOWN): same, PARTIAL.
+        - stage < 3 and drawdown >= 50% (LIQUIDATION_STAGE_3_DRAWDOWN):
+          FULL exit -- no extra peak minimum beyond PEAK_ACTIVATION_RATE,
+          it's always the last-resort stop.
+      A position whose peak never reached LIQUIDATION_STAGE_1_MIN_PEAK
+      skips the 20%-drawdown stage entirely (its bar never becomes
+      eligible even if drawdown clears it); below
+      LIQUIDATION_STAGE_2_MIN_PEAK the 40%-drawdown stage is skipped too,
+      leaving only the 50%-drawdown full exit as a safety net. Nothing can
+      fire below PEAK_ACTIVATION_RATE.
+
+    Returns (new_peak, new_threshold, stage_after_peak_bookkeeping,
+    next_stage_if_action_fires, action). `stage_after_peak_bookkeeping`
+    should always be committed (pure bookkeeping, no I/O) regardless of
+    whether the sell order actually executes; `next_stage_if_action_fires`
+    should only be committed once the corresponding order actually
+    succeeds -- mirrors how a liquidated row is only marked so after a
+    successful sell, so a failed/delayed order gets retried next tick
+    instead of being silently treated as done.
     """
     if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
-        new_peak, _ = update_peak_and_threshold(peak, current_rate, current_threshold)
-        return new_peak, INITIAL_TAKE_PROFIT_THRESHOLD
+        new_peak = max(peak, current_rate)
+        return new_peak, INITIAL_TAKE_PROFIT_THRESHOLD, 0, 0, None
     if just_reached_target:
-        return update_peak_and_threshold(current_rate, current_rate, INITIAL_TAKE_PROFIT_THRESHOLD)
-    return update_peak_and_threshold(peak, current_rate, current_threshold)
+        new_peak = current_rate
+        threshold = (
+            next_liquidation_trigger_rate(new_peak, 0) if new_peak >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
+        )
+        return new_peak, threshold, 0, 0, None
 
-
-def should_liquidate(peak: Decimal, current_rate: Decimal, threshold: Decimal, purchase_amount_krw: Decimal) -> bool:
-    """Rule 6: peak >= 10% and current_rate <= threshold -> liquidate everything.
-
-    Skipped entirely while purchase_amount_krw is still below
-    DAILY_BUY_TARGET_KRW -- a position that hasn't finished its initial DCA
-    accumulation shouldn't be fully exited on a dip; liquidation only
-    becomes possible once the position is fully built out.
-    """
-    if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
-        return False
-    return peak >= PEAK_ACTIVATION_RATE and current_rate <= threshold
+    new_peak = max(peak, current_rate)
+    stage = 0 if new_peak > peak else sell_stage
+    next_stage, action = stage, None
+    if new_peak >= PEAK_ACTIVATION_RATE:
+        if stage < 1 and new_peak >= LIQUIDATION_STAGE_1_MIN_PEAK and current_rate <= new_peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN):
+            next_stage, action = 1, "PARTIAL"
+        elif stage < 2 and new_peak >= LIQUIDATION_STAGE_2_MIN_PEAK and current_rate <= new_peak * (1 - LIQUIDATION_STAGE_2_DRAWDOWN):
+            next_stage, action = 2, "PARTIAL"
+        elif stage < 3 and current_rate <= new_peak * (1 - LIQUIDATION_STAGE_3_DRAWDOWN):
+            next_stage, action = 3, "FULL"
+        new_threshold = next_liquidation_trigger_rate(new_peak, stage)
+    else:
+        new_threshold = INITIAL_TAKE_PROFIT_THRESHOLD
+    return new_peak, new_threshold, stage, next_stage, action
 
 
 def daily_buy_amount_krw(
