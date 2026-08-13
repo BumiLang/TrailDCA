@@ -423,8 +423,44 @@ def _profit_amount_krw(item: dict, exchange_rate_usd_krw: Decimal) -> Decimal:
     return amount * exchange_rate_usd_krw
 
 
+def _closing_rate(
+    toss: TossClient, item: dict, market: Market, sessions: MarketSessions | None, now: dt.datetime
+) -> Decimal | None:
+    """The profit rate this holding would show at the most recent *fully
+    closed* trading day's close, for the once/day 최고수익률 update (see
+    allow_peak_update in strategy.update_peak_threshold_and_sell_stage_gated).
+    get_candles()'s newest daily bar is a still-forming, not-yet-closed
+    candle whenever `market` happens to be open right now (e.g. this ran
+    from a mid-session service restart, not the intended ~08:00 sync) --
+    in that case use the second-newest bar (the last day that actually
+    closed) instead. Returns None if the candle lookup fails or the
+    holding is empty, so the caller can skip today's peak update rather
+    than commit a bad value.
+    """
+    try:
+        candles = toss.get_candles(item["symbol"], interval="1d", count=2).get("candles", [])
+    except Exception:
+        logger.exception("%s: failed to fetch daily candle for peak update; skipping today's update", item["symbol"])
+        return None
+    if not candles:
+        return None
+    market_open_right_now = sessions is not None and is_market_open(sessions, market, now)
+    idx = 1 if market_open_right_now and len(candles) > 1 else 0
+    close_price = Decimal(str(candles[idx]["closePrice"]))
+    quantity = Decimal(item["quantity"])
+    purchase_amount = Decimal(item["marketValue"]["purchaseAmount"])
+    if purchase_amount == 0:
+        return None
+    return (quantity * close_price - purchase_amount) / purchase_amount
+
+
 def daily_snapshot(
-    toss: TossClient, sheets: SheetsClient, account_seq: int | str, exchange_rate_usd_krw: Decimal
+    toss: TossClient,
+    sheets: SheetsClient,
+    account_seq: int | str,
+    exchange_rate_usd_krw: Decimal,
+    sessions: MarketSessions | None,
+    now: dt.datetime,
 ) -> None:
     holdings = toss.get_holdings(account_seq)
     items = holdings.get("items", [])
@@ -450,6 +486,26 @@ def daily_snapshot(
             updates.append((row.row_number, "평가손익_원화", str(profit_krw.quantize(Decimal("1")))))
             updates.append((row.row_number, "수익률", fraction_to_percent_str(rate)))
             updates.append((row.row_number, "마지막갱신", now_iso))
+            # 최고수익률's only once/day update happens right here, using the
+            # most recent *fully closed* trading day's close (see
+            # _closing_rate) rather than this snapshot's live rate -- a
+            # mid-session service restart would otherwise let peak jump off
+            # an intraday, not-yet-closed price (see the allow_peak_update
+            # docstring on strategy.update_peak_threshold_and_sell_stage_gated).
+            # 최고수익률 updates regardless of 전략적용여부 (same as 수익률
+            # above); 익절기준/매도단계 only commit while strategy_enabled,
+            # mirroring process_symbol's own gating. If the candle lookup
+            # fails, closing_rate is None and today's peak update is simply
+            # skipped -- retried on the next daily snapshot.
+            closing_rate = _closing_rate(toss, item, Market(item.get("marketCountry", "KR")), sessions, now)
+            if closing_rate is not None:
+                new_peak, new_threshold, stage, _, _ = strategy.update_peak_threshold_and_sell_stage_gated(
+                    row.peak_rate, closing_rate, row.sell_stage, purchase_krw, just_reached_target=False, allow_peak_update=True,
+                )
+                updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
+                if row.strategy_enabled:
+                    updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
+                    updates.append((row.row_number, "매도단계", str(stage)))
         else:
             # 최고수익률 seeds to the current rate (no tracked history yet);
             # 익절기준 is the next staged-sell trigger rate for that peak
@@ -507,6 +563,37 @@ def _apply_trade_result(row: SheetRow, item: dict, exchange_rate_usd_krw: Decima
     updates.append((row.row_number, "마지막갱신", now.isoformat(timespec="seconds")))
 
 
+def _reset_peak_if_target_just_crossed(row: SheetRow, purchase_krw_before_buy: Decimal, updates: list) -> None:
+    """Call right after _apply_trade_result() for a buy that may have pushed
+    purchase_amount_krw from below DAILY_BUY_TARGET_KRW to at/above it.
+
+    process_symbol's own crossing detection (just_reached_target) only
+    catches a crossing that already happened *before* the current tick --
+    it's computed from the peak/threshold block, which runs before this
+    tick's own buy. A crossing caused by THIS buy is invisible to it: by
+    the next tick, row.purchase_amount_krw already reflects the post-buy
+    value, so the "was it below target last tick" comparison no longer
+    sees a transition. Left alone, the staged-sell gate flips open on the
+    very next tick using whatever peak silently accumulated while still
+    below target (when sell actions were fully suppressed) -- handing back
+    a stale, possibly much higher peak that can trigger an immediate
+    stage sell against a position that's barely been held.
+    """
+    if purchase_krw_before_buy >= DAILY_BUY_TARGET_KRW or row.purchase_amount_krw < DAILY_BUY_TARGET_KRW:
+        return
+    new_peak, new_threshold, stage, _, _ = strategy.update_peak_threshold_and_sell_stage_gated(
+        row.peak_rate, row.profit_rate, row.sell_stage, row.purchase_amount_krw, just_reached_target=True, allow_peak_update=False,
+    )
+    row.peak_rate, row.take_profit_threshold, row.sell_stage = new_peak, new_threshold, stage
+    updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
+    updates.append((row.row_number, "익절기준", fraction_to_percent_str(new_threshold)))
+    updates.append((row.row_number, "매도단계", str(stage)))
+    logger.info(
+        "%s: DCA target just crossed by this buy -- resetting peak/threshold/stage fresh from current rate %.4f",
+        row.symbol, new_peak,
+    )
+
+
 def _attempt_daily_buy(
     row: SheetRow,
     item: dict | None,
@@ -560,6 +647,7 @@ def _attempt_daily_buy(
         return _attempt_fallback_share_buy(row, item, executor, exchange_rate_usd_krw, today_str, now, updates)
 
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+    _reset_peak_if_target_just_crossed(row, purchase_krw, updates)
     logger.info("BUY(amount) %s target=%sKRW (%s%s)", row.symbol, amount_krw, order_amount, currency)
     return True
 
@@ -637,6 +725,13 @@ def _attempt_fallback_share_buy(
         row.peak_rate = strategy.peak_after_share_buy(projected_rate)
         updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+    # Grace-window buys are allowed to jump purchase_amount_krw straight
+    # past DAILY_BUY_TARGET_KRW in one step (see
+    # nonfractional_is_dca_grace_window) without the `if not is_grace_window`
+    # peak reset above ever running -- so a crossing here would otherwise
+    # leave peak_rate exactly as buggy/stale as the general case this
+    # function guards against next tick.
+    _reset_peak_if_target_just_crossed(row, current_purchase_krw, updates)
     logger.info(
         "BUY(1 share fallback) %s projected_rate=%.4f actual_rate=%s grace_window=%s",
         row.symbol, projected_rate, result["profitLoss"]["rate"], is_grace_window,
@@ -680,7 +775,7 @@ def process_symbol(
         valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
         profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
         new_peak, new_threshold, new_stage, _, _ = strategy.update_peak_threshold_and_sell_stage_gated(
-            current_rate, current_rate, 0, purchase_krw, just_reached_target=True
+            current_rate, current_rate, 0, purchase_krw, just_reached_target=True, allow_peak_update=False,
         )
         row.liquidated = False
         row.quantity = Decimal(item["quantity"])
@@ -777,18 +872,22 @@ def process_symbol(
         return
 
     if held:
-        # 수익률/최고수익률 keep tracking regardless of 전략적용여부 -- same
-        # spirit as the live mirror block above, so the sheet always shows
-        # an accurate peak even for symbols the strategy isn't actively
-        # managing. But the moment 전략적용여부 flips FALSE -> TRUE, treat it
-        # like any other fresh-start event (same as just_reached_target):
-        # discard whatever peak/threshold/stage accumulated while disabled
-        # and restart from the current rate, so a peak that quietly climbed
-        # while unmanaged can't hand back an already-active threshold (or a
-        # stale sell_stage) the instant management resumes.
+        # 수익률 keeps mirroring the live rate every tick regardless of
+        # 전략적용여부. 최고수익률 itself, though, no longer chases current_rate
+        # tick by tick (allow_peak_update=False here) -- it's only allowed to
+        # rise once/day, from daily_snapshot()'s ~08:00 sync (effectively
+        # 전일종가, since neither market is open at that hour). The hard
+        # resets below (DCA target just crossed, or 전략적용여부 flipping
+        # FALSE -> TRUE) still happen immediately in real time regardless --
+        # discarding whatever peak/threshold/stage accumulated while
+        # unmanaged/still building out can't wait for the next snapshot,
+        # since it directly gates whether a sell can even fire right now.
+        # Drawdown/action checks against whatever peak is on record still run
+        # every tick, so a stage can still fire intraday.
         just_enabled = row.strategy_enabled and not was_strategy_enabled
         new_peak, new_threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             row.peak_rate, current_rate, row.sell_stage, row.purchase_amount_krw, just_reached_target or just_enabled,
+            allow_peak_update=False,
         )
         row.peak_rate, row.profit_rate = new_peak, current_rate
         updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
@@ -988,7 +1087,7 @@ def main() -> None:
             # check on the same day a startup sync already covered it.
             if not startup_synced or (run_state.last_snapshot_date != today_str and now.hour >= DAILY_SNAPSHOT_HOUR_KST):
                 try:
-                    daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw)
+                    daily_snapshot(toss, sheets, account_seq, exchange_rate_usd_krw, sessions, now)
                     if now.weekday() == 0:  # Monday
                         _delete_liquidated_rows(sheets)
                     run_state.last_snapshot_date = today_str

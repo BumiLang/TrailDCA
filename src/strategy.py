@@ -50,23 +50,52 @@ def update_peak_threshold_and_sell_stage_gated(
     sell_stage: int,
     purchase_amount_krw: Decimal,
     just_reached_target: bool,
+    allow_peak_update: bool = True,
 ) -> tuple[Decimal, Decimal, int, int, str | None]:
     """Staged trailing-stop liquidation. 익절기준(threshold) is derived
     directly from the same peak/stage state via next_liquidation_trigger_rate
     -- it shows the rate at which the next not-yet-fired stage would sell.
 
-    - Below DAILY_BUY_TARGET_KRW: peak tracks in the background (so it's
-      accurate the moment the target is crossed), threshold pinned at its
-      inert -100% default, sell_stage frozen at 0, no sell action possible
-      -- liquidation only becomes possible once the position is fully
-      built out.
-    - The tick the target is first crossed (just_reached_target=True):
-      peak/threshold/stage all restart fresh from the current rate,
-      discarding whatever peak silently accumulated during the DCA phase.
-      Callers also pass True here for any other "start fresh now" event
-      that should reset the same way -- e.g. main.py ORs in the tick
-      전략적용여부 just flipped FALSE -> TRUE, discarding whatever peak
-      quietly accumulated while unmanaged.
+    allow_peak_update gates ONLY the routine "raise peak toward current_rate"
+    step (every max(peak, current_rate) below) -- main.py calls this once/tick
+    with allow_peak_update=False during regular market-hours ticks, and once a
+    day with allow_peak_update=True from daily_snapshot() (around the 08:00
+    KST sync, using that tick's holdings rate -- KR hasn't opened and US has
+    already closed by then, so it's effectively 전일종가). This does NOT gate
+    the hard resets below (just_reached_target, or a brand-new all-time-high
+    peak resetting sell_stage to 0) -- those still fire immediately, in real
+    time, on whichever tick actually triggers them; only the day-to-day
+    "chase the current rate upward" tracking is deferred to once/day. The
+    drawdown/action checks further down still run every tick in real time
+    against whatever peak is currently on record, so a stage can still fire
+    intraday against a peak that was last raised at that morning's snapshot.
+
+    - Below DAILY_BUY_TARGET_KRW while sell_stage is still 0 (never sold
+      before): peak tracks in the background (so it's accurate the moment
+      the target is crossed), threshold pinned at its inert -100% default,
+      no sell action possible -- liquidation only becomes possible once
+      the position is fully built out for the first time.
+    - The tick the target is first crossed while sell_stage is still 0
+      (just_reached_target=True): peak/threshold restart fresh from the
+      current rate, discarding whatever peak silently accumulated during
+      the DCA phase. Callers also pass True here for any other "start
+      fresh now" event that should reset the same way -- e.g. main.py ORs
+      in the tick 전략적용여부 just flipped FALSE -> TRUE, discarding
+      whatever peak quietly accumulated while unmanaged.
+    - Once sell_stage > 0 (a stage has fired at least once), BOTH of the
+      above gates are bypassed for good, even if purchase_amount_krw later
+      drops back below DAILY_BUY_TARGET_KRW -- which a partial sell
+      routinely causes, since liquidate_partial reduces cost basis roughly
+      proportionally to the quantity sold. A position that already cleared
+      a stage keeps being evaluated normally (peak tracking, drawdown
+      checks, further PARTIAL/FULL sells) regardless of purchase_amount_krw
+      or just_reached_target -- it no longer gets the "still building out"
+      treatment, and sell_stage itself is never silently reset back to 0
+      by dropping below target again. Only a brand-new (never-sold)
+      position gets the frozen/reset treatment above; peak tracking is
+      identical (max(peak, current_rate)) on both sides of the target
+      once sell_stage > 0, so there's no discontinuity left to guard
+      against at the crossing point either.
     - At/above target on later ticks: normal peak tracking (never
       decreases). A fresh (higher) peak restarts the staged cycle from
       scratch (stage reset to 0) -- a partial sell at one high doesn't
@@ -102,17 +131,17 @@ def update_peak_threshold_and_sell_stage_gated(
     successful sell, so a failed/delayed order gets retried next tick
     instead of being silently treated as done.
     """
-    if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
-        new_peak = max(peak, current_rate)
+    if purchase_amount_krw < DAILY_BUY_TARGET_KRW and sell_stage == 0:
+        new_peak = max(peak, current_rate) if allow_peak_update else peak
         return new_peak, INITIAL_TAKE_PROFIT_THRESHOLD, 0, 0, None
-    if just_reached_target:
+    if just_reached_target and sell_stage == 0:
         new_peak = current_rate
         threshold = (
             next_liquidation_trigger_rate(new_peak, 0) if new_peak >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
         )
         return new_peak, threshold, 0, 0, None
 
-    new_peak = max(peak, current_rate)
+    new_peak = max(peak, current_rate) if allow_peak_update else peak
     stage = 0 if new_peak > peak else sell_stage
     next_stage, action = stage, None
     if new_peak >= PEAK_ACTIVATION_RATE:

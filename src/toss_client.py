@@ -228,6 +228,19 @@ class TossClient:
             "GET", "/api/v1/prices", group="MARKET_DATA", params={"symbols": ",".join(symbols)}
         )
 
+    def get_candles(
+        self, symbol: str, interval: str = "1d", count: int = 100, before: str | None = None, adjusted: bool = True
+    ) -> dict:
+        """Historical OHLCV bars, newest-first (result["candles"][0] is the
+        most recent bar). For interval="1d" while that symbol's market is
+        currently open, the newest bar is the still-forming candle for
+        today -- not a real close yet; callers that want the last *closed*
+        day's close should skip it (see main._closing_rate)."""
+        params: dict[str, Any] = {"symbol": symbol, "interval": interval, "count": count, "adjusted": adjusted}
+        if before:
+            params["before"] = before
+        return self._request("GET", "/api/v1/candles", group="MARKET_DATA_CHART", params=params)
+
     # ---- order info ----
 
     def get_buying_power(self, account_seq: int | str, currency: str) -> dict:

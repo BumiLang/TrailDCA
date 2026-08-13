@@ -47,7 +47,8 @@ class TestUpdatePeakThresholdAndSellStageGated:
     def test_below_target_no_action_and_stage_frozen_at_zero(self):
         # would otherwise be a 25% drawdown from a 40% peak (past the 20%
         # stage-1 trigger), but purchase amount hasn't reached the 100k DCA
-        # target yet -- no action, stage stays 0, threshold pinned inert
+        # target yet -- no action, stage stays 0 (nothing to preserve yet),
+        # threshold pinned inert
         peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             D("0.40"), D("0.30"), 0, D("99999"), just_reached_target=False
         )
@@ -57,25 +58,63 @@ class TestUpdatePeakThresholdAndSellStageGated:
         assert next_stage == 0
         assert action is None
 
-    def test_crossing_target_resets_peak_stage_and_threshold(self):
-        # peak/threshold restart fresh from the current rate (30%); stage 0
-        # -> next trigger is the 20%-drawdown level: 0.30*0.8 = 0.24
+    def test_below_target_gate_no_longer_applies_once_a_stage_has_fired(self):
+        # a prior partial sell (stage 2) shrank purchase_amount_krw back
+        # below the 100k target (liquidate_partial reduces cost basis
+        # roughly proportionally to quantity sold) -- unlike a never-sold
+        # position, this one is evaluated normally regardless: no NEW high
+        # here (0.30 < peak 0.40) so stage stays 2, and 0.30 doesn't clear
+        # the stage-3 (50%-drawdown) bar (0.40*0.5=0.20) so no action, but
+        # the threshold is a REAL computed value, not the inert -100%
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.40"), D("0.30"), 2, D("75000"), just_reached_target=False
+        )
+        assert peak == D("0.40")
+        assert threshold == D("0.20")  # next trigger: 0.40*(1-0.50), stage 2 -> only the 50% stop remains
+        assert stage == 2
+        assert next_stage == 2
+        assert action is None
+
+    def test_below_target_partial_sell_can_still_fire_once_a_stage_has_fired(self):
+        # sell_stage=1 already fired once; purchase_amount_krw is back
+        # below the 100k target after that partial sell, but stage-2
+        # eligibility (40% drawdown from peak) still gets evaluated and
+        # fires normally instead of being gated off
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.50"), D("0.29"), 1, D("80000"), just_reached_target=False
+        )
+        assert peak == D("0.50")
+        assert threshold == D("0.30")  # next trigger: 0.50*(1-0.40)
+        assert stage == 1
+        assert next_stage == 2
+        assert action == "PARTIAL"
+
+    def test_crossing_target_no_longer_resets_peak_once_a_stage_has_fired(self):
+        # sell_stage (2) is carried over, and -- unlike the never-sold
+        # case -- peak is NOT reset to the current rate on this crossing
+        # either, since peak tracking (max(peak, current_rate)) has been
+        # running continuously on both sides of the target once a stage
+        # has fired; next trigger is computed for stage 2, not stage 0
         peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             D("0.40"), D("0.30"), 2, D("100000"), just_reached_target=True
         )
-        assert peak == D("0.30")
-        assert threshold == D("0.24")
-        assert stage == 0
-        assert next_stage == 0
+        assert peak == D("0.40")
+        assert threshold == D("0.20")
+        assert stage == 2
+        assert next_stage == 2
         assert action is None
 
-    def test_crossing_target_below_activation_stays_inert(self):
+    def test_crossing_target_full_exit_can_fire_once_a_stage_has_fired(self):
+        # deep drawdown (current 3% vs peak 40%, well past the 50% stop)
+        # on the exact crossing tick -- with sell_stage already at 2, this
+        # is no longer gated off or treated as an inert "just reached
+        # target" reset; the FULL exit fires like any other tick
         peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             D("0.40"), D("0.03"), 2, D("100000"), just_reached_target=True
         )
-        assert peak == D("0.03")
-        assert threshold == D("-1.00")
-        assert (stage, next_stage, action) == (0, 0, None)
+        assert peak == D("0.40")
+        assert threshold == D("0.20")
+        assert (stage, next_stage, action) == (2, 3, "FULL")
 
     def test_no_action_below_20pct_drawdown(self):
         # peak=40%, current=35% -> drawdown 12.5%, below the 20% stage-1 bar
@@ -203,6 +242,52 @@ class TestUpdatePeakThresholdAndSellStageGated:
             D("0.30"), D("0.24"), 0, D("150000"), just_reached_target=False
         )
         assert (stage, next_stage, action) == (0, 1, "PARTIAL")
+
+    def test_allow_peak_update_false_freezes_peak_below_target(self):
+        # current_rate (25%) is well above the old peak (10%), but with
+        # allow_peak_update=False (the per-tick call) the peak must NOT
+        # chase it -- only the once/day daily_snapshot call may raise it
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.10"), D("0.25"), 0, D("50000"), just_reached_target=False, allow_peak_update=False,
+        )
+        assert peak == D("0.10")
+        assert threshold == D("-1.00")
+        assert (stage, next_stage, action) == (0, 0, None)
+
+    def test_allow_peak_update_false_freezes_peak_at_or_above_target(self):
+        # same freeze in the normal (at/above target) branch -- peak stays
+        # at the old value (20%) even though current_rate (35%) would
+        # otherwise raise it; threshold is still computed from the frozen
+        # peak (stage 0, peak>=20% -> only the 40%/50% stages remain
+        # eligible): 0.20*(1-0.40) = 0.12
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.20"), D("0.35"), 0, D("150000"), just_reached_target=False, allow_peak_update=False,
+        )
+        assert peak == D("0.20")
+        assert threshold == D("0.12")
+        assert (stage, next_stage, action) == (0, 0, None)
+
+    def test_allow_peak_update_false_still_evaluates_drawdown_against_frozen_peak(self):
+        # peak stays frozen at 40% (allow_peak_update=False), but the
+        # drawdown/action check still runs every tick against that frozen
+        # peak -- a stage can still fire intraday without the peak itself
+        # moving
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.40"), D("0.32"), 0, D("150000"), just_reached_target=False, allow_peak_update=False,
+        )
+        assert peak == D("0.40")  # unchanged, current_rate (32%) is below peak anyway
+        assert (stage, next_stage, action) == (0, 1, "PARTIAL")
+
+    def test_allow_peak_update_false_does_not_block_hard_resets(self):
+        # just_reached_target still resets peak to current_rate immediately
+        # in real time, regardless of allow_peak_update -- only the routine
+        # "chase current_rate upward" step is deferred to once/day
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.40"), D("0.30"), 0, D("100000"), just_reached_target=True, allow_peak_update=False,
+        )
+        assert peak == D("0.30")
+        assert threshold == D("0.24")
+        assert (stage, next_stage, action) == (0, 0, None)
 
 
 class TestDailyBuyAmount:
