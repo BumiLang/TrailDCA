@@ -383,14 +383,22 @@ class OrderExecutor:
         }
 
 
+PARTIAL_SELL_MAX_DECIMALS = Decimal("0.000001")  # Toss rejects order quantities with more than 6 decimal places
+
+
 def _partial_sell_quantity(quantity: Decimal, fraction: Decimal, market: Market) -> Decimal:
     """KR doesn't support fractional order quantities (see the fallback
     whole-share buy path in _attempt_fallback_share_buy) -- floor a partial
-    sell to a whole share there; other markets keep full precision."""
+    sell to a whole share there. Other markets keep fractional precision,
+    but Toss still rejects a quantity with more than 6 decimal places
+    ("소수점 수량은 소수점 6자리까지 지원합니다") -- quantity * fraction can
+    easily produce more than that (e.g. a sellable quantity that already
+    carries several decimal places), so round down to 6 places rather than
+    risk selling slightly more than intended."""
     raw = quantity * fraction
     if market == Market.KR:
         return raw.to_integral_value(rounding=ROUND_DOWN)
-    return raw
+    return raw.quantize(PARTIAL_SELL_MAX_DECIMALS, rounding=ROUND_DOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -642,8 +650,11 @@ def _attempt_daily_buy(
             client_order_id=client_order_id,
             current_holding=item,
         )
-    except (TossApiError, OrderNotFilledError) as e:
-        logger.info("%s: amount buy failed (%s); falling back to 1-share buy", row.symbol, e)
+    except (TossApiError, OrderNotFilledError):
+        # Silently fall back -- KR symbols currently fail every amount-buy
+        # by design (Toss restricts amount orders to US-market symbols), so
+        # logging this every single DCA-buy day is pure noise. Any failure
+        # from the fallback path itself is still logged there.
         return _attempt_fallback_share_buy(row, item, executor, exchange_rate_usd_krw, today_str, now, updates)
 
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)

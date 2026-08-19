@@ -87,7 +87,7 @@ INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%, inert value before p
 # fallback-buy entry floor. A fresh (higher) peak restarts this staged
 # cycle from scratch, so a partial sell doesn't block another one after a
 # new high and pullback. Below PEAK_ACTIVATION_RATE nothing can fire.
-LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.20")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.30")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
 LIQUIDATION_STAGE_2_DRAWDOWN = _Decimal("0.40")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
 LIQUIDATION_STAGE_3_DRAWDOWN = _Decimal("0.50")  # sell everything remaining, liquidated=True
 LIQUIDATION_STAGE_SELL_FRACTION = _Decimal("0.50")

@@ -26,7 +26,7 @@ def next_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
     """The profit-rate level at which the NEXT not-yet-fired, currently
     ELIGIBLE staged sell would trigger (see
     update_peak_threshold_and_sell_stage_gated) -- e.g. sell_stage=0 with
-    peak >= LIQUIDATION_STAGE_1_MIN_PEAK means the 20%-drawdown partial
+    peak >= LIQUIDATION_STAGE_1_MIN_PEAK means the 30%-drawdown partial
     sell hasn't fired yet and is eligible, so the next trigger is
     peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN). If peak hasn't reached the
     minimum for a given stage, that stage is skipped even if sell_stage
@@ -105,10 +105,10 @@ def update_peak_threshold_and_sell_stage_gated(
       a crash straight to 45% drawdown while stage 0 hasn't fired yet)
       fires the earliest un-fired ELIGIBLE stage first, not the deepest
       one; a later, still-un-fired stage whose bar is still cleared then
-      fires on a subsequent tick, working through 20% -> 40% -> 50% in
+      fires on a subsequent tick, working through 30% -> 40% -> 50% in
       order rather than jumping ahead:
         - stage < 1 and peak >= LIQUIDATION_STAGE_1_MIN_PEAK (30%) and
-          drawdown >= 20% (LIQUIDATION_STAGE_1_DRAWDOWN): PARTIAL (sell
+          drawdown >= 30% (LIQUIDATION_STAGE_1_DRAWDOWN): PARTIAL (sell
           LIQUIDATION_STAGE_SELL_FRACTION of current holding).
         - stage < 2 and peak >= LIQUIDATION_STAGE_2_MIN_PEAK (20%) and
           drawdown >= 40% (LIQUIDATION_STAGE_2_DRAWDOWN): same, PARTIAL.
@@ -116,7 +116,7 @@ def update_peak_threshold_and_sell_stage_gated(
           FULL exit -- no extra peak minimum beyond PEAK_ACTIVATION_RATE,
           it's always the last-resort stop.
       A position whose peak never reached LIQUIDATION_STAGE_1_MIN_PEAK
-      skips the 20%-drawdown stage entirely (its bar never becomes
+      skips the 30%-drawdown stage entirely (its bar never becomes
       eligible even if drawdown clears it); below
       LIQUIDATION_STAGE_2_MIN_PEAK the 40%-drawdown stage is skipped too,
       leaving only the 50%-drawdown full exit as a safety net. Nothing can
