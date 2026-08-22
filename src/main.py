@@ -680,16 +680,6 @@ def _attempt_fallback_share_buy(
     see that function's docstring). Assumes the symbol is already held by
     the time this strategy manages it (first entry into a symbol is done
     manually, outside this bot).
-
-    Outside the DCA grace window, a fill unconditionally resets peak_rate to
-    the projected post-buy rate used for the entry decision (not maxed
-    against the prior peak) -- buying 1 more share at the current price
-    pulls the average cost basis up toward that price, which pulls the
-    profit rate down, so the peak has to reflect that dip rather than
-    staying anchored to a pre-buy high. Inside the grace window, peak_rate
-    is left alone: these buys aren't rate-gated at all, so force-resetting
-    peak to whatever (possibly poor) rate results each day would clobber
-    the trailing-stop tracking while the position is still being built out.
     """
     price = executor.current_price(row.symbol)
     current_purchase_amount = Decimal(item["marketValue"]["purchaseAmount"])
@@ -707,13 +697,12 @@ def _attempt_fallback_share_buy(
     is_grace_window = strategy.nonfractional_is_dca_grace_window(current_purchase_krw, projected_purchase_krw)
 
     if not strategy.nonfractional_entry_allowed(
-        current_purchase_krw, projected_purchase_krw, projected_rate, row.take_profit_threshold
+        current_purchase_krw, projected_purchase_krw, projected_rate, row.last_fallback_buy_rate
     ):
-        entry_floor = max(PEAK_ACTIVATION_RATE, row.take_profit_threshold)
         logger.debug(
-            "%s: skipping 1-share fallback buy, post-buy rate %.4f below entry floor %.4f "
-            "(current_purchase=%s KRW, projected_purchase=%s KRW)",
-            row.symbol, projected_rate, entry_floor, current_purchase_krw, projected_purchase_krw,
+            "%s: skipping 1-share fallback buy, post-buy rate %.4f below entry floor "
+            "(last fallback buy rate=%.4f) (current_purchase=%s KRW, projected_purchase=%s KRW)",
+            row.symbol, projected_rate, row.last_fallback_buy_rate, current_purchase_krw, projected_purchase_krw,
         )
         return False
 
@@ -732,16 +721,41 @@ def _attempt_fallback_share_buy(
         logger.warning("fallback 1-share buy also failed for %s; will retry in %ds: %s", row.symbol, DAILY_BUY_RETRY_SECONDS, e)
         return False
 
-    if not is_grace_window:
-        row.peak_rate = strategy.peak_after_share_buy(projected_rate)
-        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+    # Record this fill's projected_rate as the ratchet floor the NEXT
+    # fallback buy for this symbol must clear (see
+    # strategy.nonfractional_entry_allowed) -- every successful fill
+    # updates it, grace-window or not, so the ratchet always reflects the
+    # most recent purchase.
+    row.last_fallback_buy_rate = projected_rate
+    updates.append((row.row_number, "직전1주매수수익률", fraction_to_percent_str(projected_rate)))
+    # Outside the DCA grace window, a fill unconditionally resets peak_rate
+    # to the projected post-buy rate used for the entry decision (not maxed
+    # against the prior peak) -- buying 1 more share at the current price
+    # pulls the average cost basis toward that price, which pulls the
+    # profit rate down, so the peak has to reflect that dip rather than
+    # staying anchored to a pre-buy high. 익절기준 is recomputed from that
+    # new peak at the row's current sell_stage (not forced back to 0 --
+    # this reset doesn't imply a stage has been cleared). Inside the grace
+    # window, peak_rate is left alone: these buys aren't rate-gated at all,
+    # so force-resetting peak to whatever (possibly poor) rate results each
+    # day would clobber the trailing-stop tracking while the position is
+    # still being built out.
+    if not is_grace_window:
+        row.peak_rate = projected_rate
+        row.take_profit_threshold = (
+            strategy.next_liquidation_trigger_rate(projected_rate, row.sell_stage)
+            if projected_rate >= PEAK_ACTIVATION_RATE
+            else INITIAL_TAKE_PROFIT_THRESHOLD
+        )
+        updates.append((row.row_number, "최고수익률", fraction_to_percent_str(row.peak_rate)))
+        updates.append((row.row_number, "익절기준", fraction_to_percent_str(row.take_profit_threshold)))
     # Grace-window buys are allowed to jump purchase_amount_krw straight
     # past DAILY_BUY_TARGET_KRW in one step (see
     # nonfractional_is_dca_grace_window) without the `if not is_grace_window`
-    # peak reset above ever running -- so a crossing here would otherwise
-    # leave peak_rate exactly as buggy/stale as the general case this
-    # function guards against next tick.
+    # peak reset above ever running -- so a crossing here still needs this
+    # dedicated reset, using the REAL settled rate and taking precedence
+    # over the projected_rate reset above if both apply on this tick.
     _reset_peak_if_target_just_crossed(row, current_purchase_krw, updates)
     logger.info(
         "BUY(1 share fallback) %s projected_rate=%.4f actual_rate=%s grace_window=%s",
@@ -842,10 +856,18 @@ def process_symbol(
         # the peak/threshold block further down can tell whether this tick
         # is the one where the DCA target was just crossed.
         just_reached_target = row.purchase_amount_krw < DAILY_BUY_TARGET_KRW
+        # Our own buys and sells always update row.quantity immediately via
+        # _apply_trade_result, so any quantity increase visible here (vs.
+        # what we last recorded) reflects a buy this bot didn't place itself
+        # -- e.g. a manual top-up via the MTS app. Captured before
+        # row.quantity is overwritten below; see external_buy_detected's use
+        # further down (update_peak_threshold_and_sell_stage_gated).
+        new_quantity = Decimal(item["quantity"])
+        external_buy_detected = new_quantity > row.quantity
         purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
         valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
         profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
-        row.quantity = Decimal(item["quantity"])
+        row.quantity = new_quantity
         row.purchase_amount_krw = purchase_krw
         row.valuation_amount_krw = valuation_krw
         row.profit_amount_krw = profit_krw
@@ -898,11 +920,25 @@ def process_symbol(
         just_enabled = row.strategy_enabled and not was_strategy_enabled
         new_peak, new_threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             row.peak_rate, current_rate, row.sell_stage, row.purchase_amount_krw, just_reached_target or just_enabled,
-            allow_peak_update=False,
+            allow_peak_update=False, external_buy_detected=external_buy_detected,
         )
         row.peak_rate, row.profit_rate = new_peak, current_rate
         updates.append((row.row_number, "수익률", fraction_to_percent_str(current_rate)))
         updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
+
+        if external_buy_detected:
+            # 직전1주매수수익률 is otherwise only ever written by this bot's
+            # own fallback buys (_attempt_fallback_share_buy) -- an
+            # externally-bought quantity increase resets it too, to the
+            # same real current_rate used for the peak reset above, so a
+            # stale pre-existing ratchet floor from before this outside buy
+            # doesn't linger and block/misjudge the next fallback buy.
+            row.last_fallback_buy_rate = current_rate
+            updates.append((row.row_number, "직전1주매수수익률", fraction_to_percent_str(current_rate)))
+            logger.info(
+                "%s: external buy detected (quantity increased outside this bot) -- resetting peak/threshold/stage/직전1주매수수익률 from current rate %.4f",
+                row.symbol, new_peak,
+            )
 
         if not row.strategy_enabled:
             logger.debug("%s: strategy_enabled=False, only 수익률/최고수익률 updated", row.symbol)

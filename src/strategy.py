@@ -18,6 +18,7 @@ from src.config import (
     LIQUIDATION_STAGE_2_MIN_PEAK,
     LIQUIDATION_STAGE_3_DRAWDOWN,
     NONFRACTIONAL_DCA_CEILING_KRW,
+    NONFRACTIONAL_ENTRY_RATCHET_STEP,
     PEAK_ACTIVATION_RATE,
 )
 
@@ -51,6 +52,7 @@ def update_peak_threshold_and_sell_stage_gated(
     purchase_amount_krw: Decimal,
     just_reached_target: bool,
     allow_peak_update: bool = True,
+    external_buy_detected: bool = False,
 ) -> tuple[Decimal, Decimal, int, int, str | None]:
     """Staged trailing-stop liquidation. 익절기준(threshold) is derived
     directly from the same peak/stage state via next_liquidation_trigger_rate
@@ -121,6 +123,24 @@ def update_peak_threshold_and_sell_stage_gated(
       LIQUIDATION_STAGE_2_MIN_PEAK the 40%-drawdown stage is skipped too,
       leaving only the 50%-drawdown full exit as a safety net. Nothing can
       fire below PEAK_ACTIVATION_RATE.
+    - external_buy_detected=True (see main.process_symbol) overrides
+      everything above -- checked first, regardless of sell_stage or
+      purchase_amount_krw. It signals a quantity increase this bot didn't
+      cause itself (e.g. a manual buy via the MTS app): topping up the
+      position pulls the average cost basis toward the current price, which
+      can make current_rate drop sharply against the *old* peak on this
+      very tick -- indistinguishable from a real crash unless handled
+      specially, and would otherwise risk firing an unwanted PARTIAL/FULL
+      sell off a purely artificial "drawdown". Peak and threshold restart
+      fresh from the post-buy current_rate and sell_stage resets to 0, the
+      same as just_reached_target, but unconditionally (a partial sell
+      earlier this cycle doesn't block this reset). If the position was
+      already active (peak >= PEAK_ACTIVATION_RATE) before this buy, that
+      active status is preserved even if the diluted new_peak itself falls
+      below PEAK_ACTIVATION_RATE -- otherwise a big enough top-up could
+      silently turn off take-profit protection for a position that was
+      already being tracked for it. No sell action can fire on this same
+      tick (drawdown is 0 against the just-reset peak).
 
     Returns (new_peak, new_threshold, stage_after_peak_bookkeeping,
     next_stage_if_action_fires, action). `stage_after_peak_bookkeeping`
@@ -131,6 +151,15 @@ def update_peak_threshold_and_sell_stage_gated(
     successful sell, so a failed/delayed order gets retried next tick
     instead of being silently treated as done.
     """
+    if external_buy_detected:
+        new_peak = current_rate
+        was_active = peak >= PEAK_ACTIVATION_RATE
+        threshold = (
+            next_liquidation_trigger_rate(new_peak, 0)
+            if was_active or new_peak >= PEAK_ACTIVATION_RATE
+            else INITIAL_TAKE_PROFIT_THRESHOLD
+        )
+        return new_peak, threshold, 0, 0, None
     if purchase_amount_krw < DAILY_BUY_TARGET_KRW and sell_stage == 0:
         new_peak = max(peak, current_rate) if allow_peak_update else peak
         return new_peak, INITIAL_TAKE_PROFIT_THRESHOLD, 0, 0, None
@@ -174,15 +203,6 @@ def daily_buy_amount_krw(
     return None
 
 
-def peak_after_share_buy(rate_after_buy: Decimal) -> Decimal:
-    """When the amount-based buy fails and a single whole share is bought as
-    a fallback, the peak is reassigned to the rate resulting from that buy
-    (not maxed against the prior peak) -- a whole-share purchase can shift
-    the cost basis enough that the old peak/threshold no longer applies.
-    """
-    return rate_after_buy
-
-
 def nonfractional_is_dca_grace_window(current_purchase_krw: Decimal, projected_purchase_krw: Decimal) -> bool:
     """True while current_purchase_krw is still below DAILY_BUY_TARGET_KRW
     (100,000) and adding this share would keep cumulative purchase amount
@@ -197,7 +217,7 @@ def nonfractional_entry_allowed(
     current_purchase_krw: Decimal,
     projected_purchase_krw: Decimal,
     projected_rate: Decimal,
-    take_profit_threshold: Decimal,
+    last_fallback_buy_rate: Decimal,
 ) -> bool:
     """Whether the whole-share fallback buy may fire.
 
@@ -205,16 +225,26 @@ def nonfractional_entry_allowed(
       regardless of profit rate, same spirit as the fractional path.
     - Still below DAILY_BUY_TARGET_KRW but this buy pushes
       projected_purchase_krw to/past NONFRACTIONAL_DCA_CEILING_KRW: only
-      the flat PEAK_ACTIVATION_RATE (10%) floor applies -- not the
-      (possibly higher) trailing take-profit threshold -- so leaving the
-      grace window isn't blocked just because the trailing stop has
-      climbed above 10%.
+      the flat PEAK_ACTIVATION_RATE (10%) floor applies.
     - Otherwise (current_purchase_krw already at/above target): the rate
       that would RESULT from adding this share must clear
-      max(PEAK_ACTIVATION_RATE, take_profit_threshold).
+      max(PEAK_ACTIVATION_RATE, last_fallback_buy_rate +
+      NONFRACTIONAL_ENTRY_RATCHET_STEP) -- a ratchet keyed off the
+      projected_rate the LAST fallback buy for this symbol was allowed at
+      (see main._attempt_fallback_share_buy, which records it on every
+      successful fill). Each subsequent fallback buy must project at
+      least NONFRACTIONAL_ENTRY_RATCHET_STEP (3 points) higher than that
+      last one did, so repeated buys only go through while the position
+      is actually improving rather than standing still or drifting down
+      -- but the +3%-point step is only added ON TOP of
+      last_fallback_buy_rate, not on top of the flat
+      PEAK_ACTIVATION_RATE floor, so a symbol whose last fallback buy
+      projected below 7% just falls back to the flat 10% floor rather
+      than an inflated 13%.
     """
     if nonfractional_is_dca_grace_window(current_purchase_krw, projected_purchase_krw):
         return True
     if current_purchase_krw < DAILY_BUY_TARGET_KRW:
         return projected_rate >= PEAK_ACTIVATION_RATE
-    return projected_rate >= max(PEAK_ACTIVATION_RATE, take_profit_threshold)
+    floor = max(PEAK_ACTIVATION_RATE, last_fallback_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP)
+    return projected_rate >= floor

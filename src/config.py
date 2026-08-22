@@ -79,6 +79,14 @@ NONFRACTIONAL_DCA_CEILING_KRW = _Decimal("130000")
 PEAK_ACTIVATION_RATE = _Decimal("0.10")
 INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%, inert value before peak activates
 
+# Once current_purchase_krw is already at/above DAILY_BUY_TARGET_KRW, each
+# 1-share fallback buy (see nonfractional_entry_allowed) must project a rate
+# at least this many points higher than the LAST fallback buy's projected
+# rate did (or above PEAK_ACTIVATION_RATE if that's higher) -- a ratchet
+# that only lets repeated 1-share buys through while the position is
+# actually improving, not just standing still or drifting down.
+NONFRACTIONAL_ENTRY_RATCHET_STEP = _Decimal("0.03")
+
 # Staged trailing-stop liquidation, keyed off the *relative* drawdown from
 # peak profit rate (peak - current_rate) / peak. 익절기준 is now derived
 # directly from this same peak/stage state (see

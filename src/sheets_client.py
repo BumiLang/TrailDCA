@@ -26,7 +26,7 @@ SCOPES = [
 # format only. The custom pattern's quoted "%" is deliberate: Sheets' built-in
 # PERCENT type would additionally multiply the stored value by 100, which
 # would be wrong here since it's already scaled.
-PERCENT_COLUMNS = ["수익률", "최고수익률", "익절기준"]
+PERCENT_COLUMNS = ["수익률", "최고수익률", "익절기준", "직전1주매수수익률"]
 # KRW amount columns -- displayed with thousands separators.
 AMOUNT_COLUMNS = ["매입금액_원화", "평가금액_원화", "평가손익_원화"]
 # Columns that must be written as USER_ENTERED so Sheets coerces the value to
@@ -144,15 +144,20 @@ class SheetsClient:
         profit_rate_pct: str = "0",
         peak_rate_pct: str = "0",
         take_profit_threshold_pct: str = "-100",
+        last_fallback_buy_rate_pct: str | None = None,
         sell_stage: str = "0",
     ) -> list[str]:
         """New symbol discovered in broker holdings but absent from the sheet.
-        전략적용여부=TRUE, 청산여부=FALSE, 매도단계=0 are hard defaults; 보유수량/
-        매입금액/평가금액/평가손익/수익률/최고수익률/익절기준 reflect the real
-        holdings just fetched in the same sync (최고수익률 seeded to the
-        current profit rate, and 익절기준 derived from that peak via the
+        전략적용여부=TRUE, 청산여부=FALSE, 매도단계=0 are hard defaults;
+        보유수량/매입금액/평가금액/평가손익/수익률/최고수익률/익절기준 reflect
+        the real holdings just fetched in the same sync (최고수익률 seeded to
+        the current profit rate, and 익절기준 derived from that peak via the
         normal trailing-stop formula, since this symbol has no tracked peak
-        history yet)."""
+        history yet). 직전1주매수수익률 defaults to 최고수익률 when not given
+        explicitly -- no fallback buy has happened yet for a brand-new
+        symbol, so there's nothing better to seed the ratchet from."""
+        if last_fallback_buy_rate_pct is None:
+            last_fallback_buy_rate_pct = peak_rate_pct
         now = dt.datetime.now(KST).isoformat(timespec="seconds")
         row = {
             "종목코드": symbol,
@@ -166,6 +171,7 @@ class SheetsClient:
             "전략적용여부": "TRUE",
             "최고수익률": peak_rate_pct,
             "익절기준": take_profit_threshold_pct,
+            "직전1주매수수익률": last_fallback_buy_rate_pct,
             "매도단계": sell_stage,
             "청산여부": "FALSE",
             "마지막갱신": now,

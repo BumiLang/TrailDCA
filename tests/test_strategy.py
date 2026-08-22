@@ -289,6 +289,56 @@ class TestUpdatePeakThresholdAndSellStageGated:
         assert threshold == D("0.21")  # next trigger: 0.30*(1-0.30)
         assert (stage, next_stage, action) == (0, 0, None)
 
+    def test_external_buy_detected_resets_peak_to_current_rate(self):
+        # a manual top-up diluted the rate from a 40% peak down to 12% --
+        # peak restarts fresh from the post-buy rate, no action fires on
+        # this same tick (drawdown is 0 against the just-reset peak)
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.40"), D("0.12"), 0, D("150000"), just_reached_target=False, external_buy_detected=True,
+        )
+        assert peak == D("0.12")
+        assert (stage, next_stage, action) == (0, 0, None)
+
+    def test_external_buy_detected_resets_sell_stage_regardless_of_prior_stage(self):
+        # sell_stage was already 2 (two partial sells fired) -- an external
+        # buy resets it to 0 unconditionally, unlike every other path in
+        # this function which leaves an already-fired stage alone
+        _, _, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.40"), D("0.12"), 2, D("150000"), just_reached_target=False, external_buy_detected=True,
+        )
+        assert (stage, next_stage, action) == (0, 0, None)
+
+    def test_external_buy_detected_ignores_below_target_freeze(self):
+        # purchase_amount_krw is still well below the 100k DCA target (which
+        # would normally pin threshold at the inert -100% default) -- an
+        # external buy overrides that gate too
+        _, threshold, _, _, _ = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.05"), D("0.35"), 0, D("20000"), just_reached_target=False, external_buy_detected=True,
+        )
+        assert threshold == D("0.245")  # next trigger: 0.35*(1-0.30), new_peak=0.35 clears the stage-1 min-peak bar
+
+    def test_external_buy_detected_preserves_active_status_despite_diluted_peak(self):
+        # was already active (old peak 25% >= PEAK_ACTIVATION_RATE) before
+        # this buy -- even though the diluted post-buy rate (8%) falls below
+        # PEAK_ACTIVATION_RATE, take-profit protection must not silently
+        # switch off; threshold is still a real computed value
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.25"), D("0.08"), 1, D("150000"), just_reached_target=False, external_buy_detected=True,
+        )
+        assert peak == D("0.08")
+        assert threshold == D("0.04")  # next trigger: 0.08*(1-0.50), new_peak below both stage-1/2 min-peak bars
+        assert (stage, next_stage, action) == (0, 0, None)
+
+    def test_external_buy_detected_stays_inert_when_never_active_and_still_below_activation(self):
+        # neither the old peak (5%) nor the diluted new rate (3%) ever
+        # reached PEAK_ACTIVATION_RATE -- threshold stays pinned inert
+        peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
+            D("0.05"), D("0.03"), 0, D("150000"), just_reached_target=False, external_buy_detected=True,
+        )
+        assert peak == D("0.03")
+        assert threshold == D("-1.00")
+        assert (stage, next_stage, action) == (0, 0, None)
+
 
 class TestDailyBuyAmount:
     def test_buys_while_under_target_regardless_of_rate(self):
@@ -304,11 +354,6 @@ class TestDailyBuyAmount:
 
     def test_resumes_past_target_once_profitable(self):
         assert strategy.daily_buy_amount_krw(D("150000"), D("0.11")) == D("5000")
-
-
-class TestPeakAfterShareBuy:
-    def test_peak_reassigned_after_buy(self):
-        assert strategy.peak_after_share_buy(D("0.12")) == D("0.12")
 
 
 class TestNonfractionalIsDcaGraceWindow:
@@ -327,18 +372,36 @@ class TestNonfractionalEntryAllowed:
         # current 50,000 KRW (<100k), projected 55,000 KRW (<130k) -> allowed even at a loss
         assert strategy.nonfractional_entry_allowed(D("50000"), D("55000"), D("-0.50"), D("-1.00")) is True
 
-    def test_below_target_at_or_above_ceiling_uses_flat_10pct_ignoring_threshold(self):
+    def test_below_target_at_or_above_ceiling_uses_flat_10pct_ignoring_ratchet(self):
         # current 95,000 KRW (<100k, so not yet at the "그 외" branch) but this buy pushes
-        # projected to 135,000 (>=130k ceiling) -> flat 10% floor, threshold (17%) ignored
-        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.05"), D("0.17")) is False
-        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.10"), D("0.17")) is True
+        # projected to 135,000 (>=130k ceiling) -> flat 10% floor, last fallback
+        # buy's projected_rate (20%) ignored
+        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.05"), D("0.20")) is False
+        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.10"), D("0.20")) is True
 
-    def test_at_or_above_target_uses_threshold_regardless_of_projected_purchase(self):
-        # current purchase already >= 100k -> always the max(10%, threshold) gate,
-        # even though projected purchase (110k) hasn't reached the 130k ceiling
-        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.05"), D("-1.00")) is False
-        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.10"), D("-1.00")) is True
+    def test_at_or_above_target_never_bought_via_fallback_uses_flat_10pct(self):
+        # current purchase already >= 100k, no fallback buy has ever fired
+        # for this symbol (last_fallback_buy_rate defaults to 0)
+        # -> floor = max(10%, 0%+3%=3%) = 10% (the +3% step only matters
+        # once last_fallback_buy_rate is already at/above 7%)
+        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.09"), D("0")) is False
+        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.10"), D("0")) is True
 
-    def test_at_or_above_target_rate_gate_uses_threshold_when_higher_than_10pct(self):
-        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.16"), D("0.17")) is False
-        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.17"), D("0.17")) is True
+    def test_at_or_above_target_ratchets_off_last_fallback_buy_rate(self):
+        # last fallback buy for this symbol projected 20% -> floor = max(10%, 20%+3%) = 23%,
+        # regardless of what the current take-profit threshold happens to be
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.22"), D("0.20")) is False
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.23"), D("0.20")) is True
+
+    def test_at_or_above_target_mid_last_fallback_buy_rate_lands_between_flat_floor_and_ratchet(self):
+        # last fallback buy projected 8% (below PEAK_ACTIVATION_RATE, but
+        # above the 7% breakeven where +3% starts to matter) -> floor =
+        # max(10%, 8%+3%=11%) = 11%, strictly above the flat 10% floor
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.10"), D("0.08")) is False
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.11"), D("0.08")) is True
+
+    def test_at_or_above_target_negative_last_fallback_buy_rate_still_uses_flat_10pct(self):
+        # last fallback buy projected a loss (-30%) -- max(10%, -30%+3%=-27%) = 10%,
+        # the ratchet step never drops the floor below the flat PEAK_ACTIVATION_RATE
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.09"), D("-0.30")) is False
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.10"), D("-0.30")) is True
