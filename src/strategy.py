@@ -217,7 +217,7 @@ def nonfractional_entry_allowed(
     current_purchase_krw: Decimal,
     projected_purchase_krw: Decimal,
     projected_rate: Decimal,
-    last_fallback_buy_rate: Decimal,
+    last_buy_rate: Decimal,
 ) -> bool:
     """Whether the whole-share fallback buy may fire.
 
@@ -228,23 +228,23 @@ def nonfractional_entry_allowed(
       the flat PEAK_ACTIVATION_RATE (10%) floor applies.
     - Otherwise (current_purchase_krw already at/above target): the rate
       that would RESULT from adding this share must clear
-      max(PEAK_ACTIVATION_RATE, last_fallback_buy_rate +
-      NONFRACTIONAL_ENTRY_RATCHET_STEP) -- a ratchet keyed off the
-      projected_rate the LAST fallback buy for this symbol was allowed at
-      (see main._attempt_fallback_share_buy, which records it on every
-      successful fill). Each subsequent fallback buy must project at
-      least NONFRACTIONAL_ENTRY_RATCHET_STEP (3 points) higher than that
-      last one did, so repeated buys only go through while the position
+      max(PEAK_ACTIVATION_RATE, last_buy_rate +
+      NONFRACTIONAL_ENTRY_RATCHET_STEP) -- a ratchet keyed off the actual
+      settled rate of the LAST buy for this symbol, of either kind (see
+      main._apply_trade_result, which records row.last_buy_rate on every
+      successful fill -- fractional amount buy or 1-share fallback buy
+      alike). Each subsequent fallback buy's projected_rate must clear at
+      least NONFRACTIONAL_ENTRY_RATCHET_STEP (3 points) above that last
+      settled rate, so repeated buys only go through while the position
       is actually improving rather than standing still or drifting down
-      -- but the +3%-point step is only added ON TOP of
-      last_fallback_buy_rate, not on top of the flat
-      PEAK_ACTIVATION_RATE floor, so a symbol whose last fallback buy
-      projected below 7% just falls back to the flat 10% floor rather
-      than an inflated 13%.
+      -- but the +3%-point step is only added ON TOP of last_buy_rate,
+      not on top of the flat PEAK_ACTIVATION_RATE floor, so a symbol
+      whose last buy settled below 7% just falls back to the flat 10%
+      floor rather than an inflated 13%.
     """
     if nonfractional_is_dca_grace_window(current_purchase_krw, projected_purchase_krw):
         return True
     if current_purchase_krw < DAILY_BUY_TARGET_KRW:
         return projected_rate >= PEAK_ACTIVATION_RATE
-    floor = max(PEAK_ACTIVATION_RATE, last_fallback_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP)
+    floor = max(PEAK_ACTIVATION_RATE, last_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP)
     return projected_rate >= floor

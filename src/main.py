@@ -658,6 +658,14 @@ def _attempt_daily_buy(
         return _attempt_fallback_share_buy(row, item, executor, exchange_rate_usd_krw, today_str, now, updates)
 
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
+    # Record the actual settled rate as the ratchet floor the next 1-share
+    # fallback buy for this symbol must clear (see
+    # strategy.nonfractional_entry_allowed) -- a fractional amount buy isn't
+    # itself rate-gated, but it still moves the average cost basis, so the
+    # ratchet needs to reflect where the position actually landed rather
+    # than staying anchored to whatever a prior fallback buy left behind.
+    row.last_buy_rate = row.profit_rate
+    updates.append((row.row_number, "직전매수수익률", fraction_to_percent_str(row.last_buy_rate)))
     _reset_peak_if_target_just_crossed(row, purchase_krw, updates)
     logger.info("BUY(amount) %s target=%sKRW (%s%s)", row.symbol, amount_krw, order_amount, currency)
     return True
@@ -697,12 +705,12 @@ def _attempt_fallback_share_buy(
     is_grace_window = strategy.nonfractional_is_dca_grace_window(current_purchase_krw, projected_purchase_krw)
 
     if not strategy.nonfractional_entry_allowed(
-        current_purchase_krw, projected_purchase_krw, projected_rate, row.last_fallback_buy_rate
+        current_purchase_krw, projected_purchase_krw, projected_rate, row.last_buy_rate
     ):
         logger.debug(
             "%s: skipping 1-share fallback buy, post-buy rate %.4f below entry floor "
-            "(last fallback buy rate=%.4f) (current_purchase=%s KRW, projected_purchase=%s KRW)",
-            row.symbol, projected_rate, row.last_fallback_buy_rate, current_purchase_krw, projected_purchase_krw,
+            "(last buy rate=%.4f) (current_purchase=%s KRW, projected_purchase=%s KRW)",
+            row.symbol, projected_rate, row.last_buy_rate, current_purchase_krw, projected_purchase_krw,
         )
         return False
 
@@ -722,13 +730,14 @@ def _attempt_fallback_share_buy(
         return False
 
     _apply_trade_result(row, result, exchange_rate_usd_krw, now, updates)
-    # Record this fill's projected_rate as the ratchet floor the NEXT
+    # Record this fill's ACTUAL settled rate (not the pre-buy projected_rate
+    # used for the entry decision above) as the ratchet floor the NEXT
     # fallback buy for this symbol must clear (see
     # strategy.nonfractional_entry_allowed) -- every successful fill
     # updates it, grace-window or not, so the ratchet always reflects the
-    # most recent purchase.
-    row.last_fallback_buy_rate = projected_rate
-    updates.append((row.row_number, "직전1주매수수익률", fraction_to_percent_str(projected_rate)))
+    # most recent purchase's real outcome.
+    row.last_buy_rate = row.profit_rate
+    updates.append((row.row_number, "직전매수수익률", fraction_to_percent_str(row.last_buy_rate)))
     # Outside the DCA grace window, a fill unconditionally resets peak_rate
     # to the projected post-buy rate used for the entry decision (not maxed
     # against the prior peak) -- buying 1 more share at the current price
@@ -927,16 +936,16 @@ def process_symbol(
         updates.append((row.row_number, "최고수익률", fraction_to_percent_str(new_peak)))
 
         if external_buy_detected:
-            # 직전1주매수수익률 is otherwise only ever written by this bot's
-            # own fallback buys (_attempt_fallback_share_buy) -- an
-            # externally-bought quantity increase resets it too, to the
-            # same real current_rate used for the peak reset above, so a
-            # stale pre-existing ratchet floor from before this outside buy
-            # doesn't linger and block/misjudge the next fallback buy.
-            row.last_fallback_buy_rate = current_rate
-            updates.append((row.row_number, "직전1주매수수익률", fraction_to_percent_str(current_rate)))
+            # 직전매수수익률 is otherwise only ever written by this bot's own
+            # buys (fractional amount buys and 1-share fallback buys alike)
+            # -- an externally-bought quantity increase resets it too, to
+            # the same real current_rate used for the peak reset above, so
+            # a stale pre-existing ratchet floor from before this outside
+            # buy doesn't linger and block/misjudge the next fallback buy.
+            row.last_buy_rate = current_rate
+            updates.append((row.row_number, "직전매수수익률", fraction_to_percent_str(current_rate)))
             logger.info(
-                "%s: external buy detected (quantity increased outside this bot) -- resetting peak/threshold/stage/직전1주매수수익률 from current rate %.4f",
+                "%s: external buy detected (quantity increased outside this bot) -- resetting peak/threshold/stage/직전매수수익률 from current rate %.4f",
                 row.symbol, new_peak,
             )
 

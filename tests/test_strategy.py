@@ -379,29 +379,29 @@ class TestNonfractionalEntryAllowed:
         assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.05"), D("0.20")) is False
         assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.10"), D("0.20")) is True
 
-    def test_at_or_above_target_never_bought_via_fallback_uses_flat_10pct(self):
-        # current purchase already >= 100k, no fallback buy has ever fired
-        # for this symbol (last_fallback_buy_rate defaults to 0)
-        # -> floor = max(10%, 0%+3%=3%) = 10% (the +3% step only matters
-        # once last_fallback_buy_rate is already at/above 7%)
+    def test_at_or_above_target_never_bought_uses_flat_10pct(self):
+        # current purchase already >= 100k, no buy has ever fired for this
+        # symbol (last_buy_rate defaults to 0) -> floor = max(10%, 0%+3%=3%)
+        # = 10% (the +3% step only matters once last_buy_rate is already
+        # at/above 7%)
         assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.09"), D("0")) is False
         assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.10"), D("0")) is True
 
-    def test_at_or_above_target_ratchets_off_last_fallback_buy_rate(self):
-        # last fallback buy for this symbol projected 20% -> floor = max(10%, 20%+3%) = 23%,
+    def test_at_or_above_target_ratchets_off_last_buy_rate(self):
+        # last buy for this symbol settled at 20% -> floor = max(10%, 20%+3%) = 23%,
         # regardless of what the current take-profit threshold happens to be
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.22"), D("0.20")) is False
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.23"), D("0.20")) is True
 
-    def test_at_or_above_target_mid_last_fallback_buy_rate_lands_between_flat_floor_and_ratchet(self):
-        # last fallback buy projected 8% (below PEAK_ACTIVATION_RATE, but
-        # above the 7% breakeven where +3% starts to matter) -> floor =
+    def test_at_or_above_target_mid_last_buy_rate_lands_between_flat_floor_and_ratchet(self):
+        # last buy settled at 8% (below PEAK_ACTIVATION_RATE, but above the
+        # 7% breakeven where +3% starts to matter) -> floor =
         # max(10%, 8%+3%=11%) = 11%, strictly above the flat 10% floor
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.10"), D("0.08")) is False
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.11"), D("0.08")) is True
 
-    def test_at_or_above_target_negative_last_fallback_buy_rate_still_uses_flat_10pct(self):
-        # last fallback buy projected a loss (-30%) -- max(10%, -30%+3%=-27%) = 10%,
+    def test_at_or_above_target_negative_last_buy_rate_still_uses_flat_10pct(self):
+        # last buy settled at a loss (-30%) -- max(10%, -30%+3%=-27%) = 10%,
         # the ratchet step never drops the floor below the flat PEAK_ACTIVATION_RATE
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.09"), D("-0.30")) is False
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.10"), D("-0.30")) is True
