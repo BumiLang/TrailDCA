@@ -22,6 +22,7 @@ from pathlib import Path
 
 from src import strategy
 from src.config import (
+    DAILY_BUY_KRW,
     DAILY_BUY_RETRY_SECONDS,
     DAILY_BUY_TARGET_KRW,
     DAILY_SNAPSHOT_HOUR_KST,
@@ -228,7 +229,18 @@ class OrderExecutor:
         self._sim: dict[str, dict] = {}
 
     def current_price(self, symbol: str) -> Decimal:
-        prices = self._toss.get_prices([symbol])
+        try:
+            prices = self._toss.get_prices([symbol])
+        except TossApiError as e:
+            if e.status_code != 429:
+                raise
+            # Rate-limit bursts are usually gone a second later; one quiet
+            # retry clears most of them without bothering callers. A second
+            # failure (still rate-limited, or anything else) propagates as
+            # before -- callers are responsible for that.
+            logger.warning("%s: rate-limited fetching current price; retrying once after 1s: %s", symbol, e)
+            time.sleep(1)
+            prices = self._toss.get_prices([symbol])
         return Decimal(prices[0]["lastPrice"])
 
     def buy(
@@ -431,6 +443,25 @@ def _profit_amount_krw(item: dict, exchange_rate_usd_krw: Decimal) -> Decimal:
     return amount * exchange_rate_usd_krw
 
 
+def _profit_rate(item: dict) -> Decimal:
+    """수익률 computed purely from marketValue.purchaseAmount/amount in the
+    item's own (native) currency -- deliberately NOT item["profitLoss"]["rate"].
+    Toss's own rate for a USD holding appears to fold in KRW/USD exchange-
+    rate movement since purchase, so an unchanged US stock price can still
+    show a nonzero rate purely from currency drift (or a real stock move
+    can get masked by an offsetting currency move). Recomputing directly
+    from the two native-currency marketValue amounts keeps 수익률 -- and
+    everything derived from it: 최고수익률, 익절기준, DCA buy gating --
+    tracking the stock's own price move only, independent of exchange
+    rate. For KRW holdings this is mathematically identical to Toss's own
+    rate (there's no currency to strip out)."""
+    purchase_amount = Decimal(item["marketValue"]["purchaseAmount"])
+    if purchase_amount == 0:
+        return Decimal(0)
+    valuation_amount = Decimal(item["marketValue"]["amount"])
+    return (valuation_amount - purchase_amount) / purchase_amount
+
+
 def _closing_rate(
     toss: TossClient, item: dict, market: Market, sessions: MarketSessions | None, now: dt.datetime
 ) -> Decimal | None:
@@ -481,7 +512,7 @@ def daily_snapshot(
     for item in items:
         symbol = item["symbol"]
         quantity = Decimal(item["quantity"])
-        rate = Decimal(item["profitLoss"]["rate"])
+        rate = _profit_rate(item)
         purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
         valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
         profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
@@ -562,7 +593,7 @@ def _apply_trade_result(row: SheetRow, item: dict, exchange_rate_usd_krw: Decima
     row.purchase_amount_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
     row.valuation_amount_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
     row.profit_amount_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
-    row.profit_rate = Decimal(item["profitLoss"]["rate"])
+    row.profit_rate = _profit_rate(item)
     updates.append((row.row_number, "보유수량", str(row.quantity)))
     updates.append((row.row_number, "매입금액_원화", str(row.purchase_amount_krw.quantize(Decimal("1")))))
     updates.append((row.row_number, "평가금액_원화", str(row.valuation_amount_krw.quantize(Decimal("1")))))
@@ -612,31 +643,48 @@ def _attempt_daily_buy(
     now: dt.datetime,
     updates: list,
 ) -> bool:
-    """Rule 4 (unified, market-agnostic): DCA buy, retried until it fills.
+    """Rule 4: DCA buy, retried until it fills.
 
-    - purchase_amount_krw < 100,000: buy 5,000 KRW worth.
-    - purchase_amount_krw >= 100,000 and current_rate >= 10%: buy 5,000 KRW worth.
-    - otherwise: no buy right now.
+    - purchase_amount_krw < 100,000: buy 5,000 KRW worth, regardless of
+      market or rate.
+    - purchase_amount_krw >= 100,000, KR market: buy 5,000 KRW worth while
+      current_rate >= 10% (see daily_buy_amount_krw -- the amount order
+      always fails for KR anyway, so this is just the outer eligibility
+      check; the real gate for KR is nonfractional_entry_allowed's ratchet,
+      applied once execution falls through to _attempt_fallback_share_buy
+      below).
+    - purchase_amount_krw >= 100,000, US market: gated by
+      strategy.fractional_entry_allowed instead -- while peak_rate < 30%,
+      current_rate must clear the same last_buy_rate-based ratchet KR's
+      fallback buy uses (max(10%, last_buy_rate + 3%)), not just the flat
+      10% bar, since a US amount order actually succeeds here rather than
+      falling through to a separately-gated fallback. Once peak_rate >= 30%,
+      this converges back to the flat 10% rule.
 
     The 5,000 KRW order is placed as an amount order first (this only works
     for symbols/brokers that support fractional shares). If that order
-    errors out for any reason, fall back to buying a single whole share --
-    the amount-buy's eligibility condition already holds, so the fallback
-    doesn't need to re-check it, though it applies its own extra entry-rate
-    gate (see _attempt_fallback_share_buy) since a whole-share buy resets
+    errors out for any reason (e.g. KR, where amount orders are rejected
+    outright), fall back to buying a single whole share -- the amount-buy's
+    eligibility condition already holds, so the fallback doesn't need to
+    re-check it, though it applies its own extra entry-rate gate (see
+    _attempt_fallback_share_buy) since a whole-share buy resets
     peak/threshold on every fill, not just the first one.
 
     Returns True iff an order actually filled -- the caller only stops
     retrying (throttled to DAILY_BUY_RETRY_SECONDS) once this is True.
     """
     purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw) if item else row.purchase_amount_krw
-    amount_krw = strategy.daily_buy_amount_krw(purchase_krw, current_rate)
-    if amount_krw is None:
+    if row.market == Market.US:
+        buy_allowed = strategy.fractional_entry_allowed(purchase_krw, current_rate, row.peak_rate, row.last_buy_rate)
+    else:
+        buy_allowed = strategy.daily_buy_amount_krw(purchase_krw, current_rate) is not None
+    if not buy_allowed:
         logger.debug(
-            "%s: no buy right now (purchase=%s KRW, rate %.4f below 10%% resume bar)",
-            row.symbol, purchase_krw, current_rate,
+            "%s: no buy right now (purchase=%s KRW, rate %.4f below entry floor, peak=%.4f, last buy rate=%.4f)",
+            row.symbol, purchase_krw, current_rate, row.peak_rate, row.last_buy_rate,
         )
         return False
+    amount_krw = Decimal(DAILY_BUY_KRW)
 
     currency = "KRW" if row.market == Market.KR else "USD"
     order_amount = amount_krw if currency == "KRW" else (amount_krw / exchange_rate_usd_krw).quantize(Decimal("0.01"))
@@ -689,7 +737,21 @@ def _attempt_fallback_share_buy(
     the time this strategy manages it (first entry into a symbol is done
     manually, outside this bot).
     """
-    price = executor.current_price(row.symbol)
+    try:
+        price = executor.current_price(row.symbol)
+    except TossApiError as e:
+        # Same "log and retry next tick" contract as every other Toss call
+        # in this function -- a transient error here (e.g. 429 rate-limit)
+        # must not crash this tick uncaught. Before this, an unprotected
+        # current_price() call would propagate all the way up through
+        # _attempt_daily_buy's own except block (which is what invoked us)
+        # to process_symbol's outer safety net, landing as an ERROR-level
+        # "error processing <symbol>" instead of a normal retry.
+        logger.warning(
+            "%s: failed to fetch current price for fallback buy; will retry in %ds: %s",
+            row.symbol, DAILY_BUY_RETRY_SECONDS, e,
+        )
+        return False
     current_purchase_amount = Decimal(item["marketValue"]["purchaseAmount"])
     projected_quantity = Decimal(item["quantity"]) + Decimal(1)
     projected_purchase_amount = current_purchase_amount + price
@@ -767,8 +829,8 @@ def _attempt_fallback_share_buy(
     # over the projected_rate reset above if both apply on this tick.
     _reset_peak_if_target_just_crossed(row, current_purchase_krw, updates)
     logger.info(
-        "BUY(1 share fallback) %s projected_rate=%.4f actual_rate=%s grace_window=%s",
-        row.symbol, projected_rate, result["profitLoss"]["rate"], is_grace_window,
+        "BUY(1 share fallback) %s projected_rate=%.4f actual_rate=%.4f grace_window=%s",
+        row.symbol, projected_rate, row.profit_rate, is_grace_window,
     )
     return True
 
@@ -804,7 +866,7 @@ def process_symbol(
         # same trading day. Return without running the rest of this tick's
         # logic -- the revived row gets its normal mirror/peak/threshold/buy
         # handling starting next tick, on a clean pass.
-        current_rate = Decimal(item["profitLoss"]["rate"])
+        current_rate = _profit_rate(item)
         purchase_krw = _purchase_amount_krw(item, exchange_rate_usd_krw)
         valuation_krw = _valuation_amount_krw(item, exchange_rate_usd_krw)
         profit_krw = _profit_amount_krw(item, exchange_rate_usd_krw)
@@ -855,7 +917,7 @@ def process_symbol(
     sell_allowed = since_open >= sell_delay
 
     held = item is not None
-    current_rate = Decimal(item["profitLoss"]["rate"]) if held else Decimal(0)
+    current_rate = _profit_rate(item) if held else Decimal(0)
 
     if held:
         # Live mirror of the real position, refreshed every tick regardless

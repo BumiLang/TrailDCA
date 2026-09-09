@@ -356,6 +356,46 @@ class TestDailyBuyAmount:
         assert strategy.daily_buy_amount_krw(D("150000"), D("0.11")) == D("5000")
 
 
+class TestFractionalEntryAllowed:
+    def test_buys_while_under_target_regardless_of_rate_or_peak(self):
+        assert strategy.fractional_entry_allowed(D("0"), D("-0.50"), D("0"), D("0")) is True
+        assert strategy.fractional_entry_allowed(D("95000"), D("-0.90"), D("0.40"), D("-0.30")) is True
+
+    def test_at_target_below_30pct_peak_never_bought_uses_flat_10pct(self):
+        # peak below the 30% cutoff -> ratchet branch, but last_buy_rate
+        # defaults to 0 -> floor = max(10%, 0%+3%=3%) = 10%
+        assert strategy.fractional_entry_allowed(D("100000"), D("0.09"), D("0.15"), D("0")) is False
+        assert strategy.fractional_entry_allowed(D("100000"), D("0.10"), D("0.15"), D("0")) is True
+
+    def test_at_target_below_30pct_peak_ratchets_off_last_buy_rate(self):
+        # last buy settled at 20% -> floor = max(10%, 20%+3%) = 23%
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.22"), D("0.15"), D("0.20")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.23"), D("0.15"), D("0.20")) is True
+
+    def test_at_target_below_30pct_peak_mid_last_buy_rate_lands_between_flat_floor_and_ratchet(self):
+        # last buy settled at 8% -> floor = max(10%, 8%+3%=11%) = 11%
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.10"), D("0.20"), D("0.08")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.11"), D("0.20"), D("0.08")) is True
+
+    def test_at_target_below_30pct_peak_negative_last_buy_rate_still_uses_flat_10pct(self):
+        # last buy settled at a loss (-30%) -- max(10%, -30%+3%=-27%) = 10%
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.09"), D("0.20"), D("-0.30")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.10"), D("0.20"), D("-0.30")) is True
+
+    def test_at_target_at_or_above_30pct_peak_ignores_ratchet_uses_flat_10pct(self):
+        # peak >= LIQUIDATION_STAGE_1_MIN_PEAK -> converges back to the same
+        # flat 10% rule as daily_buy_amount_krw, regardless of how high
+        # last_buy_rate is
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.09"), D("0.30"), D("0.50")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.10"), D("0.30"), D("0.50")) is True
+
+    def test_peak_just_below_30pct_still_uses_ratchet(self):
+        # boundary check: 29% peak is strictly below the 30% cutoff, so the
+        # ratchet (off a 20% last buy rate -> floor 23%) still applies
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.22"), D("0.29"), D("0.20")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.23"), D("0.29"), D("0.20")) is True
+
+
 class TestNonfractionalIsDcaGraceWindow:
     def test_true_below_target_and_below_ceiling(self):
         assert strategy.nonfractional_is_dca_grace_window(D("50000"), D("55000")) is True

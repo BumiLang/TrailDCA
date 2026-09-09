@@ -203,6 +203,42 @@ def daily_buy_amount_krw(
     return None
 
 
+def fractional_entry_allowed(
+    purchase_amount_krw: Decimal,
+    current_rate: Decimal,
+    peak_rate: Decimal,
+    last_buy_rate: Decimal,
+) -> bool:
+    """Whether a market where the amount order actually succeeds (US) may
+    fire its once/day DCA buy -- the fractional counterpart to
+    nonfractional_entry_allowed, which only applies to markets (KR) whose
+    amount order always fails and falls back to a 1-share buy.
+
+    - Below DAILY_BUY_TARGET_KRW (100,000): buy unconditionally, same as
+      daily_buy_amount_krw's grace behavior -- still building out the
+      position, not rate-gated yet.
+    - At/above target and peak_rate < LIQUIDATION_STAGE_1_MIN_PEAK (30%):
+      current_rate must clear the same ratchet floor
+      nonfractional_entry_allowed uses -- max(PEAK_ACTIVATION_RATE,
+      last_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP). Below the 30% peak
+      bar (where the full 3-stage liquidation ladder isn't eligible yet
+      either -- see next_liquidation_trigger_rate), repeated daily buys
+      only go through while the position keeps genuinely improving,
+      matching how KR's fallback buys are already gated.
+    - At/above target and peak_rate >= LIQUIDATION_STAGE_1_MIN_PEAK: falls
+      back to the flat DAILY_BUY_RESUME_RATE (10%) floor, same as
+      daily_buy_amount_krw -- once the position has run up enough for the
+      full liquidation staging to apply, the ratchet is no longer needed
+      to keep buys disciplined.
+    """
+    if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
+        return True
+    if peak_rate < LIQUIDATION_STAGE_1_MIN_PEAK:
+        floor = max(PEAK_ACTIVATION_RATE, last_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP)
+        return current_rate >= floor
+    return current_rate >= DAILY_BUY_RESUME_RATE
+
+
 def nonfractional_is_dca_grace_window(current_purchase_krw: Decimal, projected_purchase_krw: Decimal) -> bool:
     """True while current_purchase_krw is still below DAILY_BUY_TARGET_KRW
     (100,000) and adding this share would keep cumulative purchase amount
