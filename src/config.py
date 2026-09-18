@@ -87,28 +87,43 @@ INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%, inert value before p
 # actually improving, not just standing still or drifting down.
 NONFRACTIONAL_ENTRY_RATCHET_STEP = _Decimal("0.03")
 
-# Staged trailing-stop liquidation, keyed off the *relative* drawdown from
-# peak profit rate (peak - current_rate) / peak. 익절기준 is now derived
-# directly from this same peak/stage state (see
-# strategy.next_liquidation_trigger_rate) -- it shows the rate at which the
-# next not-yet-fired stage would sell, and doubles as the non-fractional
-# fallback-buy entry floor. A fresh (higher) peak restarts this staged
-# cycle from scratch, so a partial sell doesn't block another one after a
-# new high and pullback. Below PEAK_ACTIVATION_RATE nothing can fire.
-LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.30")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
-LIQUIDATION_STAGE_2_DRAWDOWN = _Decimal("0.40")  # sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
-LIQUIDATION_STAGE_3_DRAWDOWN = _Decimal("0.50")  # sell everything remaining, liquidated=True
+# Staged trailing-stop liquidation, keyed off the drawdown of the *actual
+# share price* from its peak (not a relative drawdown of the profit-rate
+# number itself) -- since price = cost_basis * (1 + rate), a price drawdown
+# of `d` off the peak price translates to a trigger profit-rate of
+# (1 + peak) * (1 - d) - 1 (see strategy.next_liquidation_trigger_rate).
+# All three stages are eligible as soon as PEAK_ACTIVATION_RATE is reached
+# -- no separate per-stage minimum peak. Each stage sells
+# LIQUIDATION_STAGE_SELL_FRACTION of the CURRENT holding (not the original
+# position), so all three firing in sequence leaves 12.5% of the original
+# position still held. A fresh (higher) peak restarts this staged cycle
+# from scratch, so a partial sell doesn't block another one after a new
+# high and pullback. Below PEAK_ACTIVATION_RATE nothing can fire.
+LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.15")  # off peak PRICE; sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_2_DRAWDOWN = _Decimal("0.30")  # off peak PRICE; sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_3_DRAWDOWN = _Decimal("0.40")  # off peak PRICE; sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
 LIQUIDATION_STAGE_SELL_FRACTION = _Decimal("0.50")
-# How high peak has to have gotten before each of the earlier (less severe)
-# stages is even eligible to fire -- a position whose peak never really
-# took off doesn't get the same gradual staging as one that ran up a lot.
-# Stage 3 (the 50% full-exit stop-loss) has no extra minimum beyond
-# PEAK_ACTIVATION_RATE -- it's always the last-resort stop once activated.
-#   peak <  LIQUIDATION_STAGE_2_MIN_PEAK (20%): only stage 3 can fire.
-#   LIQUIDATION_STAGE_2_MIN_PEAK <= peak < LIQUIDATION_STAGE_1_MIN_PEAK (30%): stages 2-3.
-#   peak >= LIQUIDATION_STAGE_1_MIN_PEAK (30%): stages 1-3 (all of them).
-LIQUIDATION_STAGE_1_MIN_PEAK = _Decimal("0.30")
-LIQUIDATION_STAGE_2_MIN_PEAK = _Decimal("0.20")
+# Absolute profit-rate stop-loss, independent of the staged drawdown ladder
+# above and of sell_stage -- once activated (peak >= PEAK_ACTIVATION_RATE),
+# the moment current_rate drops below this, sell everything regardless of
+# which (if any) staged sell has fired. Because this is an absolute rate
+# floor while the staged triggers are relative to peak PRICE, for a low
+# peak this floor is often crossed before LIQUIDATION_STAGE_1_DRAWDOWN's
+# trigger rate is -- e.g. at peak=15%, stage 1's trigger is
+# 1.15*(1-0.15)-1 = -2.25%, well below this 3% floor, so current_rate
+# crosses 3% (triggering FULL here) long before it would ever reach -2.25%
+# (which would have triggered stage 1). This is expected, not a bug: it
+# just means the staged ladder only meaningfully gates behavior once peak
+# is high enough that its stage-1 trigger rate exceeds this floor (peak >=
+# ~21.18% for the 15%/3% pairing above).
+FULL_EXIT_PROFIT_RATE_FLOOR = _Decimal("0.03")
+
+# Peak level above which the non-fractional (KR whole-share) and fractional
+# (US amount-order) DCA buy ratchets fall back to the flat
+# DAILY_BUY_RESUME_RATE floor instead of the last_buy_rate-based ratchet --
+# unrelated to sell-stage eligibility (see strategy.fractional_entry_allowed
+# / nonfractional_entry_allowed).
+DCA_RATCHET_PEAK_CUTOFF = _Decimal("0.30")
 
 # Buy/sell orders (DCA buy, take-profit liquidation) only start once a
 # session has been open this long -- skips the volatile open, when peak/

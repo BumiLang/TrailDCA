@@ -11,38 +11,45 @@ from src.config import (
     DAILY_BUY_KRW,
     DAILY_BUY_RESUME_RATE,
     DAILY_BUY_TARGET_KRW,
+    DCA_RATCHET_PEAK_CUTOFF,
+    FULL_EXIT_PROFIT_RATE_FLOOR,
     INITIAL_TAKE_PROFIT_THRESHOLD,
     LIQUIDATION_STAGE_1_DRAWDOWN,
-    LIQUIDATION_STAGE_1_MIN_PEAK,
     LIQUIDATION_STAGE_2_DRAWDOWN,
-    LIQUIDATION_STAGE_2_MIN_PEAK,
     LIQUIDATION_STAGE_3_DRAWDOWN,
     NONFRACTIONAL_DCA_CEILING_KRW,
     NONFRACTIONAL_ENTRY_RATCHET_STEP,
     PEAK_ACTIVATION_RATE,
 )
 
+_STAGE_DRAWDOWNS = {
+    0: LIQUIDATION_STAGE_1_DRAWDOWN,
+    1: LIQUIDATION_STAGE_2_DRAWDOWN,
+    2: LIQUIDATION_STAGE_3_DRAWDOWN,
+}
+
 
 def next_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
-    """The profit-rate level at which the NEXT not-yet-fired, currently
-    ELIGIBLE staged sell would trigger (see
-    update_peak_threshold_and_sell_stage_gated) -- e.g. sell_stage=0 with
-    peak >= LIQUIDATION_STAGE_1_MIN_PEAK means the 30%-drawdown partial
-    sell hasn't fired yet and is eligible, so the next trigger is
-    peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN). If peak hasn't reached the
-    minimum for a given stage, that stage is skipped even if sell_stage
-    hasn't reached it yet -- a position whose peak never really took off
-    only ever gets the deepest (50%-drawdown) stop-loss. This is this
-    row's 익절기준: both the non-fractional fallback-buy entry gate
-    (nonfractional_entry_allowed) and the sheet's informational value use
-    it, now that liquidation itself is fully staged rather than driven by
-    a separate formula.
+    """The profit-rate level at which the NEXT not-yet-fired staged partial
+    sell would trigger, translated from a drawdown of the *share price* off
+    its peak (not a relative drawdown of the rate number itself) via
+    price = cost_basis * (1 + rate):
+
+        trigger_rate = (1 + peak) * (1 - stage_drawdown) - 1
+
+    sell_stage 0/1/2 map to LIQUIDATION_STAGE_1/2/3_DRAWDOWN (15%/30%/40%
+    off the peak price) -- all three are eligible as soon as
+    update_peak_threshold_and_sell_stage_gated has activated (peak >=
+    PEAK_ACTIVATION_RATE), no separate per-stage minimum peak. Once
+    sell_stage >= 3 (all three partial stages have already fired), there is
+    no further staged trigger -- only FULL_EXIT_PROFIT_RATE_FLOOR can still
+    force an exit at that point, so that floor is returned instead. This is
+    this row's 익절기준: the sheet's informational value uses it directly.
     """
-    if sell_stage < 1 and peak >= LIQUIDATION_STAGE_1_MIN_PEAK:
-        return peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN)
-    if sell_stage < 2 and peak >= LIQUIDATION_STAGE_2_MIN_PEAK:
-        return peak * (1 - LIQUIDATION_STAGE_2_DRAWDOWN)
-    return peak * (1 - LIQUIDATION_STAGE_3_DRAWDOWN)
+    drawdown = _STAGE_DRAWDOWNS.get(sell_stage)
+    if drawdown is None:
+        return FULL_EXIT_PROFIT_RATE_FLOOR
+    return (1 + peak) * (1 - drawdown) - 1
 
 
 def update_peak_threshold_and_sell_stage_gated(
@@ -102,27 +109,27 @@ def update_peak_threshold_and_sell_stage_gated(
       decreases). A fresh (higher) peak restarts the staged cycle from
       scratch (stage reset to 0) -- a partial sell at one high doesn't
       block another after the position makes a new, higher high and pulls
-      back again. At most ONE stage fires per tick -- checked from the
-      smallest drawdown up, so a gap straight past an earlier stage (e.g.
-      a crash straight to 45% drawdown while stage 0 hasn't fired yet)
-      fires the earliest un-fired ELIGIBLE stage first, not the deepest
-      one; a later, still-un-fired stage whose bar is still cleared then
-      fires on a subsequent tick, working through 30% -> 40% -> 50% in
-      order rather than jumping ahead:
-        - stage < 1 and peak >= LIQUIDATION_STAGE_1_MIN_PEAK (30%) and
-          drawdown >= 30% (LIQUIDATION_STAGE_1_DRAWDOWN): PARTIAL (sell
-          LIQUIDATION_STAGE_SELL_FRACTION of current holding).
-        - stage < 2 and peak >= LIQUIDATION_STAGE_2_MIN_PEAK (20%) and
-          drawdown >= 40% (LIQUIDATION_STAGE_2_DRAWDOWN): same, PARTIAL.
-        - stage < 3 and drawdown >= 50% (LIQUIDATION_STAGE_3_DRAWDOWN):
-          FULL exit -- no extra peak minimum beyond PEAK_ACTIVATION_RATE,
-          it's always the last-resort stop.
-      A position whose peak never reached LIQUIDATION_STAGE_1_MIN_PEAK
-      skips the 30%-drawdown stage entirely (its bar never becomes
-      eligible even if drawdown clears it); below
-      LIQUIDATION_STAGE_2_MIN_PEAK the 40%-drawdown stage is skipped too,
-      leaving only the 50%-drawdown full exit as a safety net. Nothing can
-      fire below PEAK_ACTIVATION_RATE.
+      back again. Two independent triggers are checked, in this order:
+        1. FULL_EXIT_PROFIT_RATE_FLOOR: if current_rate has dropped below
+           this absolute floor, FULL exit fires immediately regardless of
+           sell_stage -- even if no staged partial sell has fired yet, or
+           only some of them have. This takes priority over the staged
+           ladder below.
+        2. Otherwise, at most ONE staged partial sell fires per tick, the
+           next un-fired one in sequence (stage -> stage+1), via
+           next_liquidation_trigger_rate (15%/30%/40% *price* drawdown off
+           the peak price for stage 0/1/2 respectively) -- always PARTIAL
+           (sell LIQUIDATION_STAGE_SELL_FRACTION of current holding). A gap
+           straight past a later stage's bar on one tick still only fires
+           the next un-fired stage, working through stage 0 -> 1 -> 2 -> 3
+           in order across subsequent ticks rather than jumping ahead.
+      All three staged sells are eligible as soon as PEAK_ACTIVATION_RATE
+      is reached -- no separate per-stage minimum peak. Because
+      FULL_EXIT_PROFIT_RATE_FLOOR is an absolute rate while the staged
+      triggers are relative to peak PRICE, for a low peak the floor is
+      often crossed before the staged ladder ever fires (see
+      FULL_EXIT_PROFIT_RATE_FLOOR's comment in config.py) -- that's
+      expected, not a bug.
     - external_buy_detected=True (see main.process_symbol) overrides
       everything above -- checked first, regardless of sell_stage or
       purchase_amount_krw. It signals a quantity increase this bot didn't
@@ -174,12 +181,10 @@ def update_peak_threshold_and_sell_stage_gated(
     stage = 0 if new_peak > peak else sell_stage
     next_stage, action = stage, None
     if new_peak >= PEAK_ACTIVATION_RATE:
-        if stage < 1 and new_peak >= LIQUIDATION_STAGE_1_MIN_PEAK and current_rate <= new_peak * (1 - LIQUIDATION_STAGE_1_DRAWDOWN):
-            next_stage, action = 1, "PARTIAL"
-        elif stage < 2 and new_peak >= LIQUIDATION_STAGE_2_MIN_PEAK and current_rate <= new_peak * (1 - LIQUIDATION_STAGE_2_DRAWDOWN):
-            next_stage, action = 2, "PARTIAL"
-        elif stage < 3 and current_rate <= new_peak * (1 - LIQUIDATION_STAGE_3_DRAWDOWN):
+        if current_rate < FULL_EXIT_PROFIT_RATE_FLOOR:
             next_stage, action = 3, "FULL"
+        elif stage < 3 and current_rate <= next_liquidation_trigger_rate(new_peak, stage):
+            next_stage, action = stage + 1, "PARTIAL"
         new_threshold = next_liquidation_trigger_rate(new_peak, stage)
     else:
         new_threshold = INITIAL_TAKE_PROFIT_THRESHOLD
@@ -217,23 +222,23 @@ def fractional_entry_allowed(
     - Below DAILY_BUY_TARGET_KRW (100,000): buy unconditionally, same as
       daily_buy_amount_krw's grace behavior -- still building out the
       position, not rate-gated yet.
-    - At/above target and peak_rate < LIQUIDATION_STAGE_1_MIN_PEAK (30%):
+    - At/above target and peak_rate < DCA_RATCHET_PEAK_CUTOFF (30%):
       current_rate must clear the same ratchet floor
       nonfractional_entry_allowed uses -- max(PEAK_ACTIVATION_RATE,
-      last_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP). Below the 30% peak
-      bar (where the full 3-stage liquidation ladder isn't eligible yet
-      either -- see next_liquidation_trigger_rate), repeated daily buys
-      only go through while the position keeps genuinely improving,
-      matching how KR's fallback buys are already gated.
-    - At/above target and peak_rate >= LIQUIDATION_STAGE_1_MIN_PEAK: falls
+      last_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP). Below this bar,
+      repeated daily buys only go through while the position keeps
+      genuinely improving, matching how KR's fallback buys are already
+      gated. (This cutoff is unrelated to sell-stage eligibility -- all
+      three staged sells are eligible as soon as PEAK_ACTIVATION_RATE is
+      reached; see next_liquidation_trigger_rate.)
+    - At/above target and peak_rate >= DCA_RATCHET_PEAK_CUTOFF: falls
       back to the flat DAILY_BUY_RESUME_RATE (10%) floor, same as
-      daily_buy_amount_krw -- once the position has run up enough for the
-      full liquidation staging to apply, the ratchet is no longer needed
-      to keep buys disciplined.
+      daily_buy_amount_krw -- once the position has run up this much, the
+      ratchet is no longer needed to keep buys disciplined.
     """
     if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
         return True
-    if peak_rate < LIQUIDATION_STAGE_1_MIN_PEAK:
+    if peak_rate < DCA_RATCHET_PEAK_CUTOFF:
         floor = max(PEAK_ACTIVATION_RATE, last_buy_rate + NONFRACTIONAL_ENTRY_RATCHET_STEP)
         return current_rate >= floor
     return current_rate >= DAILY_BUY_RESUME_RATE
