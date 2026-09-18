@@ -35,6 +35,24 @@ class TestNextLiquidationTriggerRate:
         assert strategy.next_liquidation_trigger_rate(D("0.12"), 0) == D("-0.048")
 
 
+class TestDisplayedLiquidationTriggerRate:
+    def test_matches_raw_trigger_when_above_the_floor(self):
+        # peak=40%, stage 0 -> raw trigger 19%, well above the 3% floor --
+        # nothing to clamp
+        assert strategy.displayed_liquidation_trigger_rate(D("0.40"), 0) == D("0.19")
+
+    def test_clamped_up_to_the_floor_when_raw_trigger_is_below_it(self):
+        # peak=15.56%, stage 0 -> raw trigger (1.1556)*(0.85)-1 = -1.77%,
+        # below the 3% floor -- since the floor always fires first in
+        # practice (see update_peak_threshold_and_sell_stage_gated), showing
+        # -1.77% would misrepresent what's actually about to happen, so the
+        # displayed value is clamped up to the floor instead
+        assert strategy.displayed_liquidation_trigger_rate(D("0.1556"), 0) == D("0.03")
+
+    def test_stage_3_and_beyond_is_already_the_floor_unaffected_by_clamping(self):
+        assert strategy.displayed_liquidation_trigger_rate(D("0.40"), 3) == D("0.03")
+
+
 class TestUpdatePeakThresholdAndSellStageGated:
     def test_below_target_no_action_and_stage_frozen_at_zero(self):
         # would otherwise be well past every trigger, but purchase amount
@@ -57,12 +75,13 @@ class TestUpdatePeakThresholdAndSellStageGated:
         # here (0.30 < peak 0.40) so stage stays 2, and 0.30 clears neither
         # stage 2's own trigger (-0.16) nor the FULL_EXIT_PROFIT_RATE_FLOOR
         # (0.03) so no action, but the threshold is a REAL computed value,
-        # not the inert -100%
+        # not the inert -100% -- displayed clamped up to the 3% floor since
+        # the raw -0.16 trigger is unreachable (the floor would fire first)
         peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             D("0.40"), D("0.30"), 2, D("75000"), just_reached_target=False
         )
         assert peak == D("0.40")
-        assert threshold == D("-0.16")  # next trigger: (1.40)*(1-0.40)-1
+        assert threshold == D("0.03")  # raw trigger (1.40)*(1-0.40)-1=-0.16, clamped to the 3% floor
         assert stage == 2
         assert next_stage == 2
         assert action is None
@@ -92,7 +111,7 @@ class TestUpdatePeakThresholdAndSellStageGated:
             D("0.40"), D("0.30"), 2, D("100000"), just_reached_target=True
         )
         assert peak == D("0.40")
-        assert threshold == D("-0.16")
+        assert threshold == D("0.03")  # raw trigger -0.16, clamped to the floor
         assert stage == 2
         assert next_stage == 2
         assert action is None
@@ -106,7 +125,7 @@ class TestUpdatePeakThresholdAndSellStageGated:
             D("0.40"), D("0.02"), 2, D("100000"), just_reached_target=True
         )
         assert peak == D("0.40")
-        assert threshold == D("-0.16")
+        assert threshold == D("0.03")  # raw trigger -0.16, clamped to the floor
         assert (stage, next_stage, action) == (2, 3, "FULL")
 
     def test_no_action_above_stage_0_trigger(self):
@@ -242,12 +261,12 @@ class TestUpdatePeakThresholdAndSellStageGated:
         # same freeze in the normal (at/above target) branch -- peak stays
         # at the old value (20%) even though current_rate (35%) would
         # otherwise raise it; threshold is still computed from the frozen
-        # peak: (1.20)*(1-0.15)-1 = 0.02
+        # peak: (1.20)*(1-0.15)-1 = 0.02, clamped up to the 3% floor
         peak, threshold, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
             D("0.20"), D("0.35"), 0, D("150000"), just_reached_target=False, allow_peak_update=False,
         )
         assert peak == D("0.20")
-        assert threshold == D("0.02")
+        assert threshold == D("0.03")
         assert (stage, next_stage, action) == (0, 0, None)
 
     def test_allow_peak_update_false_still_evaluates_drawdown_against_frozen_peak(self):
@@ -309,7 +328,7 @@ class TestUpdatePeakThresholdAndSellStageGated:
             D("0.25"), D("0.08"), 1, D("150000"), just_reached_target=False, external_buy_detected=True,
         )
         assert peak == D("0.08")
-        assert threshold == D("-0.082")  # next trigger: (1.08)*(1-0.15)-1, new_peak=0.08
+        assert threshold == D("0.03")  # raw trigger (1.08)*(1-0.15)-1=-0.082, clamped to the floor
         assert (stage, next_stage, action) == (0, 0, None)
 
     def test_external_buy_detected_stays_inert_when_never_active_and_still_below_activation(self):

@@ -548,11 +548,11 @@ def daily_snapshot(
         else:
             # 최고수익률 seeds to the current rate (no tracked history yet);
             # 익절기준 is the next staged-sell trigger rate for that peak
-            # (see strategy.next_liquidation_trigger_rate), not hardcoded,
-            # so a newly-synced holding that's already well above the 10%
-            # activation bar gets a real value instead of the inert -100%
-            # default.
-            threshold = strategy.next_liquidation_trigger_rate(rate, 0) if rate >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
+            # (see strategy.displayed_liquidation_trigger_rate), not
+            # hardcoded, so a newly-synced holding that's already well above
+            # the 10% activation bar gets a real value instead of the inert
+            # -100% default.
+            threshold = strategy.displayed_liquidation_trigger_rate(rate, 0) if rate >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
             new_rows.append(dict(
                 symbol=symbol,
                 name=item.get("name", ""),
@@ -815,7 +815,7 @@ def _attempt_fallback_share_buy(
     if not is_grace_window:
         row.peak_rate = projected_rate
         row.take_profit_threshold = (
-            strategy.next_liquidation_trigger_rate(projected_rate, row.sell_stage)
+            strategy.displayed_liquidation_trigger_rate(projected_rate, row.sell_stage)
             if projected_rate >= PEAK_ACTIVATION_RATE
             else INITIAL_TAKE_PROFIT_THRESHOLD
         )

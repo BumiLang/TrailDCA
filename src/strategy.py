@@ -52,6 +52,22 @@ def next_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
     return (1 + peak) * (1 - drawdown) - 1
 
 
+def displayed_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
+    """The 익절기준 value shown to the user -- next_liquidation_trigger_rate's
+    raw staged-drawdown trigger, clamped up to FULL_EXIT_PROFIT_RATE_FLOOR.
+
+    FULL_EXIT_PROFIT_RATE_FLOOR always takes priority over the staged ladder
+    (see update_peak_threshold_and_sell_stage_gated), so whenever the raw
+    trigger for the current stage sits below the floor, the floor is what
+    will actually fire first as current_rate declines from peak -- showing
+    the unreachable raw value (e.g. a negative rate while peak is only just
+    above PEAK_ACTIVATION_RATE) would misrepresent what's really about to
+    happen. This does NOT change the underlying PARTIAL/FULL decision logic
+    itself, which still compares against the raw, unclamped trigger --
+    only the informational number surfaced in the sheet."""
+    return max(next_liquidation_trigger_rate(peak, sell_stage), FULL_EXIT_PROFIT_RATE_FLOOR)
+
+
 def update_peak_threshold_and_sell_stage_gated(
     peak: Decimal,
     current_rate: Decimal,
@@ -62,8 +78,12 @@ def update_peak_threshold_and_sell_stage_gated(
     external_buy_detected: bool = False,
 ) -> tuple[Decimal, Decimal, int, int, str | None]:
     """Staged trailing-stop liquidation. 익절기준(threshold) is derived
-    directly from the same peak/stage state via next_liquidation_trigger_rate
-    -- it shows the rate at which the next not-yet-fired stage would sell.
+    directly from the same peak/stage state via displayed_liquidation_trigger_rate
+    -- it shows the rate at which the next not-yet-fired stage would sell,
+    clamped up to FULL_EXIT_PROFIT_RATE_FLOOR so it never displays an
+    unreachable value below the absolute floor. The actual PARTIAL/FULL
+    decision below still compares against the raw (unclamped)
+    next_liquidation_trigger_rate.
 
     allow_peak_update gates ONLY the routine "raise peak toward current_rate"
     step (every max(peak, current_rate) below) -- main.py calls this once/tick
@@ -162,7 +182,7 @@ def update_peak_threshold_and_sell_stage_gated(
         new_peak = current_rate
         was_active = peak >= PEAK_ACTIVATION_RATE
         threshold = (
-            next_liquidation_trigger_rate(new_peak, 0)
+            displayed_liquidation_trigger_rate(new_peak, 0)
             if was_active or new_peak >= PEAK_ACTIVATION_RATE
             else INITIAL_TAKE_PROFIT_THRESHOLD
         )
@@ -173,7 +193,7 @@ def update_peak_threshold_and_sell_stage_gated(
     if just_reached_target and sell_stage == 0:
         new_peak = current_rate
         threshold = (
-            next_liquidation_trigger_rate(new_peak, 0) if new_peak >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
+            displayed_liquidation_trigger_rate(new_peak, 0) if new_peak >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
         )
         return new_peak, threshold, 0, 0, None
 
@@ -185,7 +205,7 @@ def update_peak_threshold_and_sell_stage_gated(
             next_stage, action = 3, "FULL"
         elif stage < 3 and current_rate <= next_liquidation_trigger_rate(new_peak, stage):
             next_stage, action = stage + 1, "PARTIAL"
-        new_threshold = next_liquidation_trigger_rate(new_peak, stage)
+        new_threshold = displayed_liquidation_trigger_rate(new_peak, stage)
     else:
         new_threshold = INITIAL_TAKE_PROFIT_THRESHOLD
     return new_peak, new_threshold, stage, next_stage, action
