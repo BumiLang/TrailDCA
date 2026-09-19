@@ -57,7 +57,7 @@ class SheetRow:
     peak_rate: Decimal  # fraction
     take_profit_threshold: Decimal  # fraction
     last_buy_rate: Decimal  # fraction; actual post-fill rate of the last buy (any kind), entry ratchet for the next 1-share fallback buy
-    sell_stage: int  # 0 = none, 1 = 20%-drawdown partial sold, 2 = 40%-drawdown partial sold
+    sell_stage: int  # 0 = none, 1 = stage-1 (15%-drawdown) partial sold, 2 = stage-2 (30%-drawdown) partial sold, 3 = stage-3 (40%-drawdown) full exit done
     liquidated: bool
     last_updated: str
 

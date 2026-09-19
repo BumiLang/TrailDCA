@@ -15,8 +15,11 @@ from src.config import (
     FULL_EXIT_PROFIT_RATE_FLOOR,
     INITIAL_TAKE_PROFIT_THRESHOLD,
     LIQUIDATION_STAGE_1_DRAWDOWN,
+    LIQUIDATION_STAGE_1_SELL_FRACTION,
     LIQUIDATION_STAGE_2_DRAWDOWN,
+    LIQUIDATION_STAGE_2_SELL_FRACTION,
     LIQUIDATION_STAGE_3_DRAWDOWN,
+    LIQUIDATION_STAGE_3_SELL_FRACTION,
     NONFRACTIONAL_DCA_CEILING_KRW,
     NONFRACTIONAL_ENTRY_RATCHET_STEP,
     PEAK_ACTIVATION_RATE,
@@ -26,6 +29,11 @@ _STAGE_DRAWDOWNS = {
     0: LIQUIDATION_STAGE_1_DRAWDOWN,
     1: LIQUIDATION_STAGE_2_DRAWDOWN,
     2: LIQUIDATION_STAGE_3_DRAWDOWN,
+}
+_STAGE_SELL_FRACTIONS = {
+    0: LIQUIDATION_STAGE_1_SELL_FRACTION,
+    1: LIQUIDATION_STAGE_2_SELL_FRACTION,
+    2: LIQUIDATION_STAGE_3_SELL_FRACTION,
 }
 
 
@@ -37,19 +45,30 @@ def next_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
 
         trigger_rate = (1 + peak) * (1 - stage_drawdown) - 1
 
-    sell_stage 0/1/2 map to LIQUIDATION_STAGE_1/2/3_DRAWDOWN (15%/30%/40%
+    sell_stage 0/1/2 map to LIQUIDATION_STAGE_1/2/3_DRAWDOWN (15%/30%/45%
     off the peak price) -- all three are eligible as soon as
     update_peak_threshold_and_sell_stage_gated has activated (peak >=
     PEAK_ACTIVATION_RATE), no separate per-stage minimum peak. Once
-    sell_stage >= 3 (all three partial stages have already fired), there is
-    no further staged trigger -- only FULL_EXIT_PROFIT_RATE_FLOOR can still
-    force an exit at that point, so that floor is returned instead. This is
-    this row's 익절기준: the sheet's informational value uses it directly.
+    sell_stage >= 3 (all three staged partial sells have already fired),
+    there is no further staged trigger -- only FULL_EXIT_PROFIT_RATE_FLOOR
+    can still force an exit at that point, so that floor is returned
+    instead. This is this row's 익절기준: the sheet's informational value
+    uses it directly.
     """
     drawdown = _STAGE_DRAWDOWNS.get(sell_stage)
     if drawdown is None:
         return FULL_EXIT_PROFIT_RATE_FLOOR
     return (1 + peak) * (1 - drawdown) - 1
+
+
+def liquidation_sell_fraction(sell_stage: int) -> Decimal:
+    """Fraction of the CURRENT holding sold when sell_stage's own trigger
+    fires -- sell_stage 0/1/2 map to LIQUIDATION_STAGE_1/2/3_SELL_FRACTION
+    (33%/77%/88% respectively). Each stage's fraction is of the position as
+    it stands at that moment (not the original position), so all three
+    firing in sequence leaves roughly 1.8% of the original position still
+    held (0.67 * 0.23 * 0.12)."""
+    return _STAGE_SELL_FRACTIONS[sell_stage]
 
 
 def displayed_liquidation_trigger_rate(peak: Decimal, sell_stage: int) -> Decimal:
@@ -137,12 +156,13 @@ def update_peak_threshold_and_sell_stage_gated(
            ladder below.
         2. Otherwise, at most ONE staged partial sell fires per tick, the
            next un-fired one in sequence (stage -> stage+1), via
-           next_liquidation_trigger_rate (15%/30%/40% *price* drawdown off
-           the peak price for stage 0/1/2 respectively) -- always PARTIAL
-           (sell LIQUIDATION_STAGE_SELL_FRACTION of current holding). A gap
-           straight past a later stage's bar on one tick still only fires
-           the next un-fired stage, working through stage 0 -> 1 -> 2 -> 3
-           in order across subsequent ticks rather than jumping ahead.
+           next_liquidation_trigger_rate (15%/30%/45% *price* drawdown off
+           the peak price for stage 0/1/2 respectively) -- always PARTIAL,
+           selling liquidation_sell_fraction(stage) of the CURRENT holding
+           (33%/77%/88% for stage 0/1/2 respectively). A gap straight past
+           a later stage's bar on one tick still only fires the next
+           un-fired stage, working through stage 0 -> 1 -> 2 -> 3 in order
+           across subsequent ticks rather than jumping ahead.
       All three staged sells are eligible as soon as PEAK_ACTIVATION_RATE
       is reached -- no separate per-stage minimum peak. Because
       FULL_EXIT_PROFIT_RATE_FLOOR is an absolute rate while the staged

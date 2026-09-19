@@ -93,16 +93,20 @@ NONFRACTIONAL_ENTRY_RATCHET_STEP = _Decimal("0.03")
 # of `d` off the peak price translates to a trigger profit-rate of
 # (1 + peak) * (1 - d) - 1 (see strategy.next_liquidation_trigger_rate).
 # All three stages are eligible as soon as PEAK_ACTIVATION_RATE is reached
-# -- no separate per-stage minimum peak. Each stage sells
-# LIQUIDATION_STAGE_SELL_FRACTION of the CURRENT holding (not the original
-# position), so all three firing in sequence leaves 12.5% of the original
-# position still held. A fresh (higher) peak restarts this staged cycle
-# from scratch, so a partial sell doesn't block another one after a new
-# high and pullback. Below PEAK_ACTIVATION_RATE nothing can fire.
-LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.15")  # off peak PRICE; sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
-LIQUIDATION_STAGE_2_DRAWDOWN = _Decimal("0.30")  # off peak PRICE; sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
-LIQUIDATION_STAGE_3_DRAWDOWN = _Decimal("0.40")  # off peak PRICE; sell LIQUIDATION_STAGE_SELL_FRACTION of current holding
-LIQUIDATION_STAGE_SELL_FRACTION = _Decimal("0.50")
+# -- no separate per-stage minimum peak. Each stage sells its own
+# LIQUIDATION_STAGE_*_SELL_FRACTION of the CURRENT holding (not the
+# original position) -- 33% / 77% / 88% for stages 1/2/3 respectively, so
+# all three firing in sequence leaves roughly 1.8% of the original position
+# still held (0.67 * 0.23 * 0.12). A fresh (higher) peak restarts this
+# staged cycle from scratch, so a partial sell doesn't block another one
+# after a new high and pullback. Below PEAK_ACTIVATION_RATE nothing can
+# fire.
+LIQUIDATION_STAGE_1_DRAWDOWN = _Decimal("0.15")  # off peak PRICE; sell LIQUIDATION_STAGE_1_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_2_DRAWDOWN = _Decimal("0.30")  # off peak PRICE; sell LIQUIDATION_STAGE_2_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_3_DRAWDOWN = _Decimal("0.45")  # off peak PRICE; sell LIQUIDATION_STAGE_3_SELL_FRACTION of current holding
+LIQUIDATION_STAGE_1_SELL_FRACTION = _Decimal("0.33")
+LIQUIDATION_STAGE_2_SELL_FRACTION = _Decimal("0.77")
+LIQUIDATION_STAGE_3_SELL_FRACTION = _Decimal("0.88")
 # Absolute profit-rate stop-loss, independent of the staged drawdown ladder
 # above and of sell_stage -- once activated (peak >= PEAK_ACTIVATION_RATE),
 # the moment current_rate drops below this, sell everything regardless of

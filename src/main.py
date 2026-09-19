@@ -30,7 +30,6 @@ from src.config import (
     KR_BUY_DELAY_AFTER_OPEN,
     KR_SELL_DELAY_AFTER_OPEN,
     KST,
-    LIQUIDATION_STAGE_SELL_FRACTION,
     PEAK_ACTIVATION_RATE,
     PROJECT_ROOT,
     SHEET_FLUSH_INTERVAL_SECONDS,
@@ -1059,7 +1058,7 @@ def process_symbol(
                 client_order_id = f"{today_str}-{row.symbol}-STAGE{next_stage}"[:36]
                 try:
                     result = executor.liquidate_partial(
-                        row.symbol, row.market, currency, LIQUIDATION_STAGE_SELL_FRACTION, client_order_id=client_order_id
+                        row.symbol, row.market, currency, strategy.liquidation_sell_fraction(stage), client_order_id=client_order_id
                     )
                 except (TossApiError, OrderNotFilledError) as e:
                     # Same retry-next-tick contract as the FULL branch above.
