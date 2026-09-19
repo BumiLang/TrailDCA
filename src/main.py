@@ -340,25 +340,61 @@ class OrderExecutor:
         """Sell `fraction` of the current sellable quantity as a market
         order (e.g. fraction=0.5 sells half the position). KR quantities
         are floored to a whole share since KR doesn't support fractional
-        order quantities (see _attempt_fallback_share_buy). Returns the
-        post-trade holdings item (same shape as buy()/the dry-run
-        simulation), or None if the computed quantity rounds down to zero
-        -- too small a whole-share KR position to split at this fraction;
-        the caller should leave sell_stage untouched and let a deeper
-        stage fire instead."""
+        order quantities (see _attempt_fallback_share_buy); a fraction
+        that floors all the way to 0 shares sells
+        MINIMUM_WHOLE_SHARE_SELL_QUANTITY (1) instead, as long as the
+        position holds at least that many shares (see
+        _partial_sell_quantity). Returns the post-trade holdings item
+        (same shape as buy()/the dry-run simulation), or None only when
+        there's nothing sellable at all -- the caller should leave
+        sell_stage untouched and let a deeper stage fire instead.
+
+        Some individual US-market symbols reject fractional order
+        quantities even though the market in general allows them -- if a
+        fractional sell is rejected outright, retry once with the quantity
+        floored to a whole share (or the same 1-share minimum if that
+        floors to 0) before giving up, mirroring the KR whole-share path
+        and the retry-once pattern in current_price(). A second failure
+        (still rejected, or any other error) propagates normally."""
         if self._live:
             sellable = Decimal(self._toss.get_sellable_quantity(self._account_seq, symbol)["sellableQuantity"])
             qty = _partial_sell_quantity(sellable, fraction, market)
             if qty <= 0:
                 return None
-            order = self._toss.place_order(
-                self._account_seq,
-                symbol,
-                "SELL",
-                "MARKET",
-                quantity=qty,
-                client_order_id=client_order_id,
-            )
+            try:
+                order = self._toss.place_order(
+                    self._account_seq,
+                    symbol,
+                    "SELL",
+                    "MARKET",
+                    quantity=qty,
+                    client_order_id=client_order_id,
+                )
+            except TossApiError as e:
+                if qty == qty.to_integral_value(rounding=ROUND_DOWN):
+                    raise
+                whole_qty = qty.to_integral_value(rounding=ROUND_DOWN)
+                if whole_qty <= 0:
+                    # Too thin a slice to floor to a full share -- fall back
+                    # to the minimum sell quantity (1 share) instead of
+                    # skipping, capped by what's actually sellable so this
+                    # never oversells a sub-1-share position.
+                    whole_qty = min(MINIMUM_WHOLE_SHARE_SELL_QUANTITY, sellable.to_integral_value(rounding=ROUND_DOWN))
+                    if whole_qty <= 0:
+                        return None
+                logger.warning(
+                    "%s: fractional partial sell (qty=%s) rejected; retrying once with whole-share qty=%s: %s",
+                    symbol, qty, whole_qty, e,
+                )
+                qty = whole_qty
+                order = self._toss.place_order(
+                    self._account_seq,
+                    symbol,
+                    "SELL",
+                    "MARKET",
+                    quantity=qty,
+                    client_order_id=client_order_id,
+                )
             final = self._toss.wait_for_terminal_status(self._account_seq, order["orderId"])
             if final.get("status") != "FILLED":
                 raise OrderNotFilledError(final)
@@ -395,6 +431,7 @@ class OrderExecutor:
 
 
 PARTIAL_SELL_MAX_DECIMALS = Decimal("0.000001")  # Toss rejects order quantities with more than 6 decimal places
+MINIMUM_WHOLE_SHARE_SELL_QUANTITY = Decimal("1")  # floor for any whole-share partial sell, KR or US-fallback
 
 
 def _partial_sell_quantity(quantity: Decimal, fraction: Decimal, market: Market) -> Decimal:
@@ -405,10 +442,19 @@ def _partial_sell_quantity(quantity: Decimal, fraction: Decimal, market: Market)
     ("소수점 수량은 소수점 6자리까지 지원합니다") -- quantity * fraction can
     easily produce more than that (e.g. a sellable quantity that already
     carries several decimal places), so round down to 6 places rather than
-    risk selling slightly more than intended."""
+    risk selling slightly more than intended.
+
+    For KR, flooring a small fraction of a small position can floor all the
+    way to 0 shares -- since `quantity` there is already a whole number of
+    shares, quantity > 0 guarantees at least 1 share is actually held, so
+    MINIMUM_WHOLE_SHARE_SELL_QUANTITY (1) is sold instead of skipping the
+    stage entirely."""
     raw = quantity * fraction
     if market == Market.KR:
-        return raw.to_integral_value(rounding=ROUND_DOWN)
+        floored = raw.to_integral_value(rounding=ROUND_DOWN)
+        if floored == 0 and quantity > 0:
+            return MINIMUM_WHOLE_SHARE_SELL_QUANTITY
+        return floored
     return raw.quantize(PARTIAL_SELL_MAX_DECIMALS, rounding=ROUND_DOWN)
 
 
