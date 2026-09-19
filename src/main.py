@@ -381,6 +381,11 @@ class OrderExecutor:
                     # never oversells a sub-1-share position.
                     whole_qty = min(MINIMUM_WHOLE_SHARE_SELL_QUANTITY, sellable.to_integral_value(rounding=ROUND_DOWN))
                     if whole_qty <= 0:
+                        logger.warning(
+                            "%s: fractional partial sell (qty=%s) rejected and sellable quantity (%s) is under "
+                            "1 whole share; skipping this stage: %s",
+                            symbol, qty, sellable, e,
+                        )
                         return None
                 logger.warning(
                     "%s: fractional partial sell (qty=%s) rejected; retrying once with whole-share qty=%s: %s",
@@ -595,7 +600,7 @@ def daily_snapshot(
             # 익절기준 is the next staged-sell trigger rate for that peak
             # (see strategy.displayed_liquidation_trigger_rate), not
             # hardcoded, so a newly-synced holding that's already well above
-            # the 10% activation bar gets a real value instead of the inert
+            # the 15% activation bar gets a real value instead of the inert
             # -100% default.
             threshold = strategy.displayed_liquidation_trigger_rate(rate, 0) if rate >= PEAK_ACTIVATION_RATE else INITIAL_TAKE_PROFIT_THRESHOLD
             new_rows.append(dict(
@@ -693,7 +698,7 @@ def _attempt_daily_buy(
     - purchase_amount_krw < 100,000: buy 5,000 KRW worth, regardless of
       market or rate.
     - purchase_amount_krw >= 100,000, KR market: buy 5,000 KRW worth while
-      current_rate >= 10% (see daily_buy_amount_krw -- the amount order
+      current_rate >= 15% (see daily_buy_amount_krw -- the amount order
       always fails for KR anyway, so this is just the outer eligibility
       check; the real gate for KR is nonfractional_entry_allowed's ratchet,
       applied once execution falls through to _attempt_fallback_share_buy
@@ -701,10 +706,10 @@ def _attempt_daily_buy(
     - purchase_amount_krw >= 100,000, US market: gated by
       strategy.fractional_entry_allowed instead -- while peak_rate < 30%,
       current_rate must clear the same last_buy_rate-based ratchet KR's
-      fallback buy uses (max(10%, last_buy_rate + 3%)), not just the flat
-      10% bar, since a US amount order actually succeeds here rather than
+      fallback buy uses (max(15%, last_buy_rate + 3%)), not just the flat
+      15% bar, since a US amount order actually succeeds here rather than
       falling through to a separately-gated fallback. Once peak_rate >= 30%,
-      this converges back to the flat 10% rule.
+      this converges back to the flat 15% rule.
 
     The 5,000 KRW order is placed as an amount order first (this only works
     for symbols/brokers that support fractional shares). If that order
@@ -776,7 +781,7 @@ def _attempt_fallback_share_buy(
     """1-share fallback for symbols that don't support fractional-amount
     orders. Every DCA-buy day for such a symbol goes through this path (the
     amount order fails every time). Entry eligibility is decided by
-    strategy.nonfractional_entry_allowed (DCA grace window / flat 10% floor
+    strategy.nonfractional_entry_allowed (DCA grace window / flat 15% floor
     once past the ceiling / rate-vs-threshold gate once past the target --
     see that function's docstring). Assumes the symbol is already held by
     the time this strategy manages it (first entry into a symbol is done

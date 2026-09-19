@@ -238,7 +238,7 @@ def daily_buy_amount_krw(
 
     - Below the 100,000 KRW accumulation target: keep buying 5,000/day
       regardless of profit rate.
-    - At/above target: only keep buying 5,000/day while current_rate >= 10%.
+    - At/above target: only keep buying 5,000/day while current_rate >= 15%.
       Once profitable, buying continues indefinitely (no re-cap).
     """
     if purchase_amount_krw < DAILY_BUY_TARGET_KRW:
@@ -272,7 +272,7 @@ def fractional_entry_allowed(
       three staged sells are eligible as soon as PEAK_ACTIVATION_RATE is
       reached; see next_liquidation_trigger_rate.)
     - At/above target and peak_rate >= DCA_RATCHET_PEAK_CUTOFF: falls
-      back to the flat DAILY_BUY_RESUME_RATE (10%) floor, same as
+      back to the flat DAILY_BUY_RESUME_RATE (15%) floor, same as
       daily_buy_amount_krw -- once the position has run up this much, the
       ratchet is no longer needed to keep buys disciplined.
     """
@@ -306,7 +306,7 @@ def nonfractional_entry_allowed(
       regardless of profit rate, same spirit as the fractional path.
     - Still below DAILY_BUY_TARGET_KRW but this buy pushes
       projected_purchase_krw to/past NONFRACTIONAL_DCA_CEILING_KRW: only
-      the flat PEAK_ACTIVATION_RATE (10%) floor applies.
+      the flat PEAK_ACTIVATION_RATE (15%) floor applies.
     - Otherwise (current_purchase_krw already at/above target): the rate
       that would RESULT from adding this share must clear
       max(PEAK_ACTIVATION_RATE, last_buy_rate +
@@ -320,8 +320,8 @@ def nonfractional_entry_allowed(
       is actually improving rather than standing still or drifting down
       -- but the +3%-point step is only added ON TOP of last_buy_rate,
       not on top of the flat PEAK_ACTIVATION_RATE floor, so a symbol
-      whose last buy settled below 7% just falls back to the flat 10%
-      floor rather than an inflated 13%.
+      whose last buy settled below 12% just falls back to the flat 15%
+      floor rather than an inflated 18%.
     """
     if nonfractional_is_dca_grace_window(current_purchase_krw, projected_purchase_krw):
         return True

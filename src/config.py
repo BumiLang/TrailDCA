@@ -68,7 +68,7 @@ from decimal import Decimal as _Decimal
 
 DAILY_BUY_KRW = _Decimal("5000")
 DAILY_BUY_TARGET_KRW = _Decimal("100000")
-DAILY_BUY_RESUME_RATE = _Decimal("0.10")  # profit rate must reach this to keep buying past target
+DAILY_BUY_RESUME_RATE = _Decimal("0.15")  # profit rate must reach this to keep buying past target
 DAILY_BUY_RETRY_SECONDS = 60  # throttle interval between buy attempts until one actually fills
 # Non-fractional (whole-share) buys skip the entry-rate gate entirely while
 # still below DAILY_BUY_TARGET_KRW *and* this buy wouldn't push cumulative
@@ -76,7 +76,7 @@ DAILY_BUY_RETRY_SECONDS = 60  # throttle interval between buy attempts until one
 # spirit as the fractional path, with headroom above DAILY_BUY_TARGET_KRW
 # since a single whole-share buy can jump past it in one step.
 NONFRACTIONAL_DCA_CEILING_KRW = _Decimal("130000")
-PEAK_ACTIVATION_RATE = _Decimal("0.10")
+PEAK_ACTIVATION_RATE = _Decimal("0.15")
 INITIAL_TAKE_PROFIT_THRESHOLD = _Decimal("-1.00")  # -100%, inert value before peak activates
 
 # Once current_purchase_krw is already at/above DAILY_BUY_TARGET_KRW, each

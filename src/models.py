@@ -85,7 +85,7 @@ class SheetRow:
         # Blank cell (e.g. a row that predates this column, never backfilled)
         # falls back to peak_rate rather than 0 -- 0 would read as "the last
         # buy settled at a full loss," which would wrongly force the flat
-        # 10% floor in nonfractional_entry_allowed for a position that's
+        # 15% floor in nonfractional_entry_allowed for a position that's
         # actually already deep in profit.
         raw_last_buy = str(record.get("직전매수수익률", "")).strip()
         last_buy_rate = cls._dec(raw_last_buy) / Decimal(100) if raw_last_buy else peak_rate

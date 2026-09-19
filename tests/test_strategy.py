@@ -31,8 +31,8 @@ class TestNextLiquidationTriggerRate:
     def test_low_peak_uses_the_same_formula_no_eligibility_gating(self):
         # unlike the old design, there's no per-stage minimum peak anymore
         # -- stage 0 uses the same formula even for a peak just above
-        # PEAK_ACTIVATION_RATE: cost*1.12*0.85 = cost*0.952 -> rate = -0.048
-        assert strategy.next_liquidation_trigger_rate(D("0.12"), 0) == D("-0.048")
+        # PEAK_ACTIVATION_RATE: cost*1.16*0.85 = cost*0.986 -> rate = -0.014
+        assert strategy.next_liquidation_trigger_rate(D("0.16"), 0) == D("-0.014")
 
 
 class TestLiquidationSellFraction:
@@ -226,11 +226,11 @@ class TestUpdatePeakThresholdAndSellStageGated:
         assert (stage, next_stage, action) == (0, 3, "FULL")
 
     def test_full_exit_floor_fires_right_at_activation_with_no_prior_partial(self):
-        # peak just reached PEAK_ACTIVATION_RATE (10%) and current is
+        # peak just reached PEAK_ACTIVATION_RATE (15%) and current is
         # already below the 3% floor -- FULL fires even though sell_stage
         # is still 0 and no partial sell has ever happened for this symbol
         _, _, stage, next_stage, action = strategy.update_peak_threshold_and_sell_stage_gated(
-            D("0.10"), D("0.025"), 0, D("150000"), just_reached_target=False
+            D("0.15"), D("0.025"), 0, D("150000"), just_reached_target=False
         )
         assert (stage, next_stage, action) == (0, 3, "FULL")
 
@@ -365,11 +365,11 @@ class TestDailyBuyAmount:
         assert strategy.daily_buy_amount_krw(D("100000"), D("0.05")) is None
         assert strategy.daily_buy_amount_krw(D("100000"), D("0.09")) is None
 
-    def test_resumes_at_target_once_rate_reaches_10pct(self):
-        assert strategy.daily_buy_amount_krw(D("100000"), D("0.10")) == D("5000")
+    def test_resumes_at_target_once_rate_reaches_15pct(self):
+        assert strategy.daily_buy_amount_krw(D("100000"), D("0.15")) == D("5000")
 
     def test_resumes_past_target_once_profitable(self):
-        assert strategy.daily_buy_amount_krw(D("150000"), D("0.11")) == D("5000")
+        assert strategy.daily_buy_amount_krw(D("150000"), D("0.16")) == D("5000")
 
 
 class TestFractionalEntryAllowed:
@@ -377,33 +377,33 @@ class TestFractionalEntryAllowed:
         assert strategy.fractional_entry_allowed(D("0"), D("-0.50"), D("0"), D("0")) is True
         assert strategy.fractional_entry_allowed(D("95000"), D("-0.90"), D("0.40"), D("-0.30")) is True
 
-    def test_at_target_below_30pct_peak_never_bought_uses_flat_10pct(self):
+    def test_at_target_below_30pct_peak_never_bought_uses_flat_15pct(self):
         # peak below the 30% cutoff -> ratchet branch, but last_buy_rate
-        # defaults to 0 -> floor = max(10%, 0%+3%=3%) = 10%
-        assert strategy.fractional_entry_allowed(D("100000"), D("0.09"), D("0.15"), D("0")) is False
-        assert strategy.fractional_entry_allowed(D("100000"), D("0.10"), D("0.15"), D("0")) is True
+        # defaults to 0 -> floor = max(15%, 0%+3%=3%) = 15%
+        assert strategy.fractional_entry_allowed(D("100000"), D("0.14"), D("0.15"), D("0")) is False
+        assert strategy.fractional_entry_allowed(D("100000"), D("0.15"), D("0.15"), D("0")) is True
 
     def test_at_target_below_30pct_peak_ratchets_off_last_buy_rate(self):
-        # last buy settled at 20% -> floor = max(10%, 20%+3%) = 23%
+        # last buy settled at 20% -> floor = max(15%, 20%+3%) = 23%
         assert strategy.fractional_entry_allowed(D("150000"), D("0.22"), D("0.15"), D("0.20")) is False
         assert strategy.fractional_entry_allowed(D("150000"), D("0.23"), D("0.15"), D("0.20")) is True
 
     def test_at_target_below_30pct_peak_mid_last_buy_rate_lands_between_flat_floor_and_ratchet(self):
-        # last buy settled at 8% -> floor = max(10%, 8%+3%=11%) = 11%
-        assert strategy.fractional_entry_allowed(D("150000"), D("0.10"), D("0.20"), D("0.08")) is False
-        assert strategy.fractional_entry_allowed(D("150000"), D("0.11"), D("0.20"), D("0.08")) is True
+        # last buy settled at 13% -> floor = max(15%, 13%+3%=16%) = 16%
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.15"), D("0.20"), D("0.13")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.16"), D("0.20"), D("0.13")) is True
 
-    def test_at_target_below_30pct_peak_negative_last_buy_rate_still_uses_flat_10pct(self):
-        # last buy settled at a loss (-30%) -- max(10%, -30%+3%=-27%) = 10%
-        assert strategy.fractional_entry_allowed(D("150000"), D("0.09"), D("0.20"), D("-0.30")) is False
-        assert strategy.fractional_entry_allowed(D("150000"), D("0.10"), D("0.20"), D("-0.30")) is True
+    def test_at_target_below_30pct_peak_negative_last_buy_rate_still_uses_flat_15pct(self):
+        # last buy settled at a loss (-30%) -- max(15%, -30%+3%=-27%) = 15%
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.14"), D("0.20"), D("-0.30")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.15"), D("0.20"), D("-0.30")) is True
 
-    def test_at_target_at_or_above_30pct_peak_ignores_ratchet_uses_flat_10pct(self):
+    def test_at_target_at_or_above_30pct_peak_ignores_ratchet_uses_flat_15pct(self):
         # peak >= LIQUIDATION_STAGE_1_MIN_PEAK -> converges back to the same
-        # flat 10% rule as daily_buy_amount_krw, regardless of how high
+        # flat 15% rule as daily_buy_amount_krw, regardless of how high
         # last_buy_rate is
-        assert strategy.fractional_entry_allowed(D("150000"), D("0.09"), D("0.30"), D("0.50")) is False
-        assert strategy.fractional_entry_allowed(D("150000"), D("0.10"), D("0.30"), D("0.50")) is True
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.14"), D("0.30"), D("0.50")) is False
+        assert strategy.fractional_entry_allowed(D("150000"), D("0.15"), D("0.30"), D("0.50")) is True
 
     def test_peak_just_below_30pct_still_uses_ratchet(self):
         # boundary check: 29% peak is strictly below the 30% cutoff, so the
@@ -428,36 +428,36 @@ class TestNonfractionalEntryAllowed:
         # current 50,000 KRW (<100k), projected 55,000 KRW (<130k) -> allowed even at a loss
         assert strategy.nonfractional_entry_allowed(D("50000"), D("55000"), D("-0.50"), D("-1.00")) is True
 
-    def test_below_target_at_or_above_ceiling_uses_flat_10pct_ignoring_ratchet(self):
+    def test_below_target_at_or_above_ceiling_uses_flat_15pct_ignoring_ratchet(self):
         # current 95,000 KRW (<100k, so not yet at the "그 외" branch) but this buy pushes
-        # projected to 135,000 (>=130k ceiling) -> flat 10% floor, last fallback
+        # projected to 135,000 (>=130k ceiling) -> flat 15% floor, last fallback
         # buy's projected_rate (20%) ignored
-        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.05"), D("0.20")) is False
-        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.10"), D("0.20")) is True
+        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.14"), D("0.20")) is False
+        assert strategy.nonfractional_entry_allowed(D("95000"), D("135000"), D("0.15"), D("0.20")) is True
 
-    def test_at_or_above_target_never_bought_uses_flat_10pct(self):
+    def test_at_or_above_target_never_bought_uses_flat_15pct(self):
         # current purchase already >= 100k, no buy has ever fired for this
-        # symbol (last_buy_rate defaults to 0) -> floor = max(10%, 0%+3%=3%)
-        # = 10% (the +3% step only matters once last_buy_rate is already
-        # at/above 7%)
-        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.09"), D("0")) is False
-        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.10"), D("0")) is True
+        # symbol (last_buy_rate defaults to 0) -> floor = max(15%, 0%+3%=3%)
+        # = 15% (the +3% step only matters once last_buy_rate is already
+        # at/above 12%)
+        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.14"), D("0")) is False
+        assert strategy.nonfractional_entry_allowed(D("100000"), D("110000"), D("0.15"), D("0")) is True
 
     def test_at_or_above_target_ratchets_off_last_buy_rate(self):
-        # last buy for this symbol settled at 20% -> floor = max(10%, 20%+3%) = 23%,
+        # last buy for this symbol settled at 20% -> floor = max(15%, 20%+3%) = 23%,
         # regardless of what the current take-profit threshold happens to be
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.22"), D("0.20")) is False
         assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.23"), D("0.20")) is True
 
     def test_at_or_above_target_mid_last_buy_rate_lands_between_flat_floor_and_ratchet(self):
-        # last buy settled at 8% (below PEAK_ACTIVATION_RATE, but above the
-        # 7% breakeven where +3% starts to matter) -> floor =
-        # max(10%, 8%+3%=11%) = 11%, strictly above the flat 10% floor
-        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.10"), D("0.08")) is False
-        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.11"), D("0.08")) is True
+        # last buy settled at 13% (below PEAK_ACTIVATION_RATE, but above the
+        # 12% breakeven where +3% starts to matter) -> floor =
+        # max(15%, 13%+3%=16%) = 16%, strictly above the flat 15% floor
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.15"), D("0.13")) is False
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.16"), D("0.13")) is True
 
-    def test_at_or_above_target_negative_last_buy_rate_still_uses_flat_10pct(self):
-        # last buy settled at a loss (-30%) -- max(10%, -30%+3%=-27%) = 10%,
+    def test_at_or_above_target_negative_last_buy_rate_still_uses_flat_15pct(self):
+        # last buy settled at a loss (-30%) -- max(15%, -30%+3%=-27%) = 15%,
         # the ratchet step never drops the floor below the flat PEAK_ACTIVATION_RATE
-        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.09"), D("-0.30")) is False
-        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.10"), D("-0.30")) is True
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.14"), D("-0.30")) is False
+        assert strategy.nonfractional_entry_allowed(D("150000"), D("160000"), D("0.15"), D("-0.30")) is True
